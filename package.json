@@ -1,0 +1,43 @@
+{
+  "name": "agent-loop",
+  "version": "1.0.0",
+  "description": "Loop 本地 Claude Code CLI 事件监听与执行器",
+  "type": "module",
+  "bin": {
+    "agent-loop": "./dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node dist/cli.js",
+    "dev": "tsx src/cli.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm build"
+  },
+  "keywords": [
+    "claude",
+    "ai",
+    "webhook",
+    "automation",
+    "cli",
+    "smee",
+    "agent"
+  ],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.25.0",
+  "dependencies": {
+    "commander": "^12.0.0",
+    "dotenv": "^16.4.5",
+    "smee-client": "^2.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.1",
+    "typescript": "^5.7.2"
+  }
+}

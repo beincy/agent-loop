@@ -1,0 +1,20 @@
+{
+  "defaultWorkspace": "/path/to/your/default/workspace",
+  "subscriptions": [
+    {
+      "name": "my-first-sub",
+      "smeeUrl": "https://smee.io/YOUR_CHANNEL_ID",
+      "enabled": true,
+      "basePrompt": "你是一个自动化助手。请根据以下 Webhook 事件内容，完成相应的代码操作。",
+      "reporter": "console"
+    },
+    {
+      "name": "another-sub",
+      "smeeUrl": "https://smee.io/ANOTHER_CHANNEL_ID",
+      "enabled": false,
+      "basePrompt": "你是一个 CI/CD 助手，请分析以下 GitHub Actions 事件并给出建议。",
+      "workspace": "/path/to/specific/workspace",
+      "reporter": "console"
+    }
+  ]
+}
