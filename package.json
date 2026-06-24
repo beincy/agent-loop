@@ -1,7 +1,10 @@
 {
-  "name": "agent-loop",
+  "name": "@beincy/agent-loop",
   "version": "1.0.0",
   "description": "Loop 本地 Claude Code CLI 事件监听与执行器",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "bin": {
     "agent-loop": "./dist/cli.js"
