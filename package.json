@@ -19,7 +19,9 @@
     "dev": "tsx src/cli.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "pnpm build"
+    "prepublishOnly": "pnpm build",
+"publish:public": "npm publish --access public --registry=https://registry.npmjs.org/",
+    "tologin": "npm login --registry=https://registry.npmjs.org/"
   },
   "keywords": [
     "claude",
