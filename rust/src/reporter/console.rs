@@ -22,10 +22,6 @@ impl ConsoleReporter {
 
 #[async_trait]
 impl Reporter for ConsoleReporter {
-    fn name(&self) -> &str {
-        "console"
-    }
-
     async fn initialize(&self) -> Result<()> {
         fs::create_dir_all(&self.log_dir)?;
         Ok(())

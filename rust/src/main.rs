@@ -4,6 +4,7 @@ mod filter;
 mod reporter;
 mod subscriber;
 mod types;
+mod wasm_host;
 
 use anyhow::Result;
 use clap::Parser;
