@@ -1,5 +1,6 @@
 mod config;
 mod executor;
+mod filter;
 mod reporter;
 mod subscriber;
 mod types;
@@ -81,6 +82,8 @@ async fn main() -> Result<()> {
             base_prompt: prompt,
             workspace: Some(ws),
             reporter: Some(args.reporter.clone()),
+            filter_regex: None,
+            wasm_policy: None,
         }];
     } else {
         // 配置文件模式

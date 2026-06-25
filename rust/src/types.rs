@@ -19,6 +19,13 @@ pub struct SubscriptionConfig {
     pub workspace: Option<String>,
     /// 汇报器名称，不填则使用 "console"
     pub reporter: Option<String>,
+    /// 正则过滤：对整个事件 JSON 做匹配，不匹配则跳过
+    #[serde(rename = "filterRegex")]
+    pub filter_regex: Option<String>,
+    /// WASM 策略插件名称（不含 .wasm 后缀）
+    /// 文件路径：~/.agent-loop/policy/<name>.wasm
+    #[serde(rename = "wasmPolicy")]
+    pub wasm_policy: Option<String>,
 }
 
 /// 根配置

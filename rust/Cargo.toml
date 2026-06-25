@@ -20,3 +20,5 @@ dirs = "5"
 chrono = "0.4"
 async-trait = "0.1"
 anyhow = "1"
+regex = "1"
+wasmtime = { version = "29", default-features = false, features = ["cranelift", "runtime", "std"] }

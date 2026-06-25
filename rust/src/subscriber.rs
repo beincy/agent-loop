@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::executor::execute_with_claude;
+use crate::filter::apply_filters;
 use crate::reporter::Reporter;
 use crate::types::{SmeeEventData, SubscriptionConfig};
 
@@ -170,15 +171,34 @@ pub async fn start_subscriber(
             let default_workspace = default_workspace.clone();
 
             tokio::spawn(async move {
-                println!("\n📨 [{}] 收到事件，准备调用 Claude...", subscription.name);
-                match execute_with_claude(&subscription, &default_workspace, &event).await {
-                    Ok(result) => {
-                        if let Err(e) = reporter.report(&result).await {
-                            eprintln!("[{}] 汇报失败: {e}", subscription.name);
-                        }
-                    }
+                println!("\n📨 [{}] 收到事件，执行预处理...", subscription.name);
+                match apply_filters(
+                    event,
+                    subscription.filter_regex.as_deref(),
+                    subscription.wasm_policy.as_deref(),
+                )
+                .await
+                {
                     Err(e) => {
-                        eprintln!("[{}] 执行异常: {e}", subscription.name);
+                        eprintln!("[{}] 过滤器错误: {e}", subscription.name);
+                    }
+                    Ok(fr) if !fr.allow => {
+                        println!("[{}] 事件已被过滤，跳过", subscription.name);
+                    }
+                    Ok(fr) => {
+                        println!("   ➡️  准备调用 Claude...");
+                        match execute_with_claude(&subscription, &default_workspace, &fr.event)
+                            .await
+                        {
+                            Ok(result) => {
+                                if let Err(e) = reporter.report(&result).await {
+                                    eprintln!("[{}] 汇报失败: {e}", subscription.name);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[{}] 执行异常: {e}", subscription.name);
+                            }
+                        }
                     }
                 }
             });
@@ -186,15 +206,32 @@ pub async fn start_subscriber(
     } else {
         // 串行模式：顺序处理队列中的每个事件
         while let Some(event) = rx.recv().await {
-            println!("\n📨 [{}] 收到事件，准备调用 Claude...", subscription.name);
-            match execute_with_claude(&subscription, &default_workspace, &event).await {
-                Ok(result) => {
-                    if let Err(e) = reporter.report(&result).await {
-                        eprintln!("[{}] 汇报失败: {e}", subscription.name);
-                    }
-                }
+            println!("\n📨 [{}] 收到事件，执行预处理...", subscription.name);
+            match apply_filters(
+                event,
+                subscription.filter_regex.as_deref(),
+                subscription.wasm_policy.as_deref(),
+            )
+            .await
+            {
                 Err(e) => {
-                    eprintln!("[{}] 执行异常: {e}", subscription.name);
+                    eprintln!("[{}] 过滤器错误: {e}", subscription.name);
+                }
+                Ok(fr) if !fr.allow => {
+                    println!("[{}] 事件已被过滤，跳过", subscription.name);
+                }
+                Ok(fr) => {
+                    println!("   ➡️  准备调用 Claude...");
+                    match execute_with_claude(&subscription, &default_workspace, &fr.event).await {
+                        Ok(result) => {
+                            if let Err(e) = reporter.report(&result).await {
+                                eprintln!("[{}] 汇报失败: {e}", subscription.name);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[{}] 执行异常: {e}", subscription.name);
+                        }
+                    }
                 }
             }
         }
