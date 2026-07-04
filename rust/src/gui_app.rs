@@ -34,26 +34,48 @@ impl AgentLoopApp {
     fn setup_fonts(ctx: &egui::Context) {
         let mut fonts = egui::FontDefinitions::default();
 
-        fonts.font_data.insert(
-            "chinese_font".to_owned(),
-            egui::FontData::from_static(include_bytes!(
-                "../assets/LXGWWenKai-Regular.ttf"
-            )),
-        );
+        // 尝试加载系统中文字体
+        if let Some(font_data) = Self::load_system_font() {
+            fonts.font_data.insert("system_chinese".to_owned(), font_data);
 
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "chinese_font".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "system_chinese".to_owned());
 
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .push("chinese_font".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("system_chinese".to_owned());
 
-        ctx.set_fonts(fonts);
+            ctx.set_fonts(fonts);
+        }
+    }
+
+    fn load_system_font() -> Option<egui::FontData> {
+        // macOS 系统字体路径
+        let font_paths = [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            // Windows 路径
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\simhei.ttf",
+            // Linux 路径
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        ];
+
+        for path in &font_paths {
+            if let Ok(data) = std::fs::read(path) {
+                return Some(egui::FontData::from_owned(data));
+            }
+        }
+
+        None
     }
 
     fn save_config(&mut self) {
