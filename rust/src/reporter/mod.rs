@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub mod console;
 
 use std::fs::{self, OpenOptions};

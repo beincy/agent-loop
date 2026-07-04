@@ -1,26 +1,21 @@
 use eframe::egui;
-use std::sync::{Arc, Mutex};
 
 use crate::gui_config::{AppConfig, Subscription};
 
 pub struct AgentLoopApp {
     config: AppConfig,
-    editing_subscription: Option<usize>,
     new_subscription: Subscription,
     is_running: bool,
     status_message: String,
-    runtime_handle: Arc<Mutex<Option<tokio::runtime::Handle>>>,
 }
 
 impl Default for AgentLoopApp {
     fn default() -> Self {
         Self {
             config: AppConfig::load(),
-            editing_subscription: None,
             new_subscription: Subscription::default(),
             is_running: false,
             status_message: "就绪".to_string(),
-            runtime_handle: Arc::new(Mutex::new(None)),
         }
     }
 }

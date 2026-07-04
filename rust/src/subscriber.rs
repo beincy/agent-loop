@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::time::Duration;
