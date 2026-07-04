@@ -52,3 +52,39 @@ cargo build --release
 ## License
 
 MIT
+
+## WASM 插件扩展
+
+### Reporter 插件
+将自定义 reporter WASM 文件放在 `~/.agent-loop/reporters/` 目录：
+```bash
+~/.agent-loop/
+  └── reporters/
+      ├── console.wasm
+      └── custom-reporter.wasm
+```
+
+### Filter 插件
+将自定义 filter WASM 文件放在 `~/.agent-loop/filters/` 目录：
+```bash
+~/.agent-loop/
+  └── filters/
+      ├── security-filter.wasm
+      └── custom-filter.wasm
+```
+
+插件会自动在 GUI 的下拉框中显示。
+
+### 构建 WASM 插件
+参考 `wasm-plugins/` 目录下的示例：
+- `console-reporter`: Reporter 插件示例
+- `security-filter`: Filter 插件示例
+
+构建步骤：
+```bash
+cd wasm-plugins/your-plugin
+cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/your_plugin.wasm ~/.agent-loop/reporters/
+# 或
+cp target/wasm32-unknown-unknown/release/your_plugin.wasm ~/.agent-loop/filters/
+```
