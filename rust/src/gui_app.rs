@@ -26,8 +26,34 @@ impl Default for AgentLoopApp {
 }
 
 impl AgentLoopApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::setup_fonts(&cc.egui_ctx);
         Self::default()
+    }
+
+    fn setup_fonts(ctx: &egui::Context) {
+        let mut fonts = egui::FontDefinitions::default();
+
+        fonts.font_data.insert(
+            "chinese_font".to_owned(),
+            egui::FontData::from_static(include_bytes!(
+                "../assets/LXGWWenKai-Regular.ttf"
+            )),
+        );
+
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "chinese_font".to_owned());
+
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .push("chinese_font".to_owned());
+
+        ctx.set_fonts(fonts);
     }
 
     fn save_config(&mut self) {
