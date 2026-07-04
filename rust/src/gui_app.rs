@@ -7,6 +7,8 @@ pub struct AgentLoopApp {
     new_subscription: Subscription,
     is_running: bool,
     status_message: String,
+    available_reporters: Vec<String>,
+    available_filters: Vec<String>,
 }
 
 impl Default for AgentLoopApp {
@@ -16,6 +18,8 @@ impl Default for AgentLoopApp {
             new_subscription: Subscription::default(),
             is_running: false,
             status_message: "就绪".to_string(),
+            available_reporters: Self::scan_reporters(),
+            available_filters: Self::scan_filters(),
         }
     }
 }
@@ -80,6 +84,49 @@ impl AgentLoopApp {
             self.status_message = "配置已保存".to_string();
         }
     }
+
+    fn scan_reporters() -> Vec<String> {
+        let mut reporters = vec!["console".to_string()];
+
+        if let Some(home) = dirs::home_dir() {
+            let reporters_dir = home.join(".agent-loop").join("reporters");
+            if let Ok(entries) = std::fs::read_dir(reporters_dir) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.path().file_stem() {
+                        if entry.path().extension().and_then(|s| s.to_str()) == Some("wasm") {
+                            reporters.push(name.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        reporters.sort();
+        reporters.dedup();
+        reporters
+    }
+
+    fn scan_filters() -> Vec<String> {
+        let mut filters = vec!["none".to_string()];
+
+        if let Some(home) = dirs::home_dir() {
+            let filters_dir = home.join(".agent-loop").join("filters");
+            if let Ok(entries) = std::fs::read_dir(filters_dir) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.path().file_stem() {
+                        if entry.path().extension().and_then(|s| s.to_str()) == Some("wasm") {
+                            filters.push(name.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        filters.push("regex".to_string());
+        filters.sort();
+        filters.dedup();
+        filters
+    }
 }
 
 impl eframe::App for AgentLoopApp {
@@ -140,6 +187,12 @@ impl eframe::App for AgentLoopApp {
 
                             ui.label(format!("Smee URL: {}", sub.smee_url));
                             ui.label(format!("提示词: {}", sub.base_prompt));
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Reporter: {}", sub.reporter.as_deref().unwrap_or("console")));
+                                if let Some(filter) = &sub.filter_regex {
+                                    ui.label(format!("| Filter: {}", filter));
+                                }
+                            });
                         });
                     }
 
@@ -179,6 +232,78 @@ impl eframe::App for AgentLoopApp {
                             None
                         } else {
                             Some(workspace)
+                        };
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Reporter:");
+                        let mut selected_reporter = self.new_subscription.reporter.clone()
+                            .unwrap_or_else(|| "console".to_string());
+
+                        egui::ComboBox::from_id_salt("reporter_select")
+                            .selected_text(&selected_reporter)
+                            .show_ui(ui, |ui| {
+                                for reporter in &self.available_reporters {
+                                    if ui.selectable_label(
+                                        selected_reporter == *reporter,
+                                        reporter
+                                    ).clicked() {
+                                        selected_reporter = reporter.clone();
+                                    }
+                                }
+                            });
+
+                        self.new_subscription.reporter = Some(selected_reporter);
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Filter:");
+                        let mut selected_filter = self.new_subscription.filter_regex.clone()
+                            .unwrap_or_else(|| "none".to_string());
+                        
+
+                        egui::ComboBox::from_id_salt("filter_select")
+                            .selected_text(if selected_filter == "none" {
+                                "无过滤"
+                            } else if selected_filter.starts_with("regex:") {
+                                "自定义正则"
+                            } else {
+                                &selected_filter
+                            })
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(selected_filter == "none", "无过滤").clicked() {
+                                    selected_filter = "none".to_string();
+                                }
+                                if ui.selectable_label(
+                                    selected_filter.starts_with("regex:"),
+                                    "自定义正则"
+                                ).clicked() {
+                                    selected_filter = "regex:".to_string();
+                                }
+                                for filter in &self.available_filters {
+                                    if filter != "none" && filter != "regex" {
+                                        if ui.selectable_label(
+                                            selected_filter == *filter,
+                                            filter
+                                        ).clicked() {
+                                            selected_filter = filter.clone();
+                                        }
+                                    }
+                                }
+                            });
+
+                        if selected_filter.starts_with("regex:") {
+                            ui.label("正则:");
+                            let mut regex_input = selected_filter.strip_prefix("regex:").unwrap_or("").to_string();
+                            if ui.text_edit_singleline(&mut regex_input).changed() {
+                                selected_filter = format!("regex:{}", regex_input);
+                            }
+                        }
+
+                        self.new_subscription.filter_regex = if selected_filter == "none" {
+                            None
+                        } else {
+                            Some(selected_filter)
                         };
                     });
 
