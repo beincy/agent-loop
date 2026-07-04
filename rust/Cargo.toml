@@ -22,3 +22,8 @@ async-trait = "0.1"
 anyhow = "1"
 regex = "1"
 wasmtime = { version = "29", default-features = false, features = ["cranelift", "runtime", "std"] }
+tokio-tungstenite = "0.24"
+url = "2"
+eframe = "0.29"
+egui = "0.29"
+uuid = { version = "1", features = ["v4"] }
