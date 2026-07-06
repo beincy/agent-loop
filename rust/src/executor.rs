@@ -6,7 +6,7 @@ use tokio::process::Command;
 
 use crate::types::{ExecutionResult, SmeeEventData, SubscriptionConfig};
 
-fn build_prompt(base_prompt: &str, event: &SmeeEventData) -> String {
+pub fn build_prompt(base_prompt: &str, event: &SmeeEventData) -> String {
     let body_str = match &event.body {
         serde_json::Value::String(s) => s.clone(),
         v => serde_json::to_string_pretty(v).unwrap_or_default(),

@@ -1,4 +1,8 @@
+mod bridge;
+mod bridge_client;
+mod bridge_service;
 mod config;
+mod event_log;
 mod executor;
 mod filter;
 mod gui_app;

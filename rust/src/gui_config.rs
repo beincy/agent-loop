@@ -27,15 +27,28 @@ impl Default for Subscription {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    /// cc-connect Bridge WebSocket 端点（bridge-protocol.zh-CN.md）
     pub ws_url: String,
+    /// Bridge 认证 token（config.toml [bridge].token）
+    #[serde(default)]
+    pub bridge_token: String,
+    /// 启动 cc-connect 的命令行
+    #[serde(default = "default_cc_connect_command")]
+    pub cc_connect_command: String,
     pub default_workspace: String,
     pub subscriptions: Vec<Subscription>,
+}
+
+fn default_cc_connect_command() -> String {
+    "cc-connect".to_string()
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            ws_url: "ws://localhost:8765".to_string(),
+            ws_url: "ws://localhost:9810/bridge/ws".to_string(),
+            bridge_token: String::new(),
+            cc_connect_command: default_cc_connect_command(),
             default_workspace: dirs::home_dir()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),

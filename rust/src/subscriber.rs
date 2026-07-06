@@ -95,7 +95,7 @@ fn parse_smee_payload(raw: &str) -> Option<SmeeEventData> {
 }
 
 /// 连接 smee.io SSE 并持续推送事件，断线后自动重连
-async fn run_sse_loop(smee_url: &str, tx: mpsc::UnboundedSender<SmeeEventData>) {
+pub async fn run_sse_loop(smee_url: &str, tx: mpsc::UnboundedSender<SmeeEventData>) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(0)) // SSE 长连接，不设超时
         .build()
