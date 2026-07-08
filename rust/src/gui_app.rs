@@ -15,6 +15,11 @@ pub struct AgentLoopApp {
     selected_subscription: Option<usize>,
     show_new_subscription_dialog: bool,
     show_settings_window: bool,
+    show_command_dialog: bool,
+    command_target: usize,
+    command_input: String,
+    /// 推送类型：false = 指令（card_action），true = 消息（message）
+    command_send_message: bool,
     show_token: bool,
     show_webhook_logs: bool,
     show_result_logs: bool,
@@ -38,6 +43,10 @@ impl Default for AgentLoopApp {
             selected_subscription: None,
             show_new_subscription_dialog: false,
             show_settings_window: false,
+            show_command_dialog: false,
+            command_target: 0,
+            command_input: String::new(),
+            command_send_message: false,
             show_token: false,
             show_webhook_logs: true,
             show_result_logs: true,
@@ -104,6 +113,18 @@ impl AgentLoopApp {
         None
     }
 
+    /// 把用户输入的指令规范化为 card_action 值：`/model` → `cmd:/model`
+    fn command_action(input: &str) -> String {
+        let t = input.trim();
+        if t.starts_with("cmd:") {
+            t.to_string()
+        } else if t.starts_with('/') {
+            format!("cmd:{t}")
+        } else {
+            format!("cmd:/{t}")
+        }
+    }
+
     fn save_config(&mut self) {
         if let Err(e) = self.config.save() {
             self.status_message = format!("保存失败: {}", e);
@@ -137,7 +158,8 @@ impl AgentLoopApp {
         let mut filters = vec!["none".to_string()];
 
         if let Some(home) = dirs::home_dir() {
-            let filters_dir = home.join(".agent-loop").join("filters");
+            // 与 filter::apply_filters 的加载目录保持一致（policy，而非 filters）
+            let filters_dir = home.join(".agent-loop").join("policy");
             if let Ok(entries) = std::fs::read_dir(filters_dir) {
                 for entry in entries.flatten() {
                     if let Some(name) = entry.path().file_stem() {
@@ -155,12 +177,71 @@ impl AgentLoopApp {
         filters
     }
 
+    /// 从 WS 地址解析出主机和端口（ws 默认 80 / wss 默认 443）
+    fn ws_endpoint(ws_url: &str) -> Option<(String, u16)> {
+        let u = url::Url::parse(ws_url).ok()?;
+        let host = u.host_str()?.to_string();
+        let port = u.port_or_known_default()?;
+        Some((host, port))
+    }
+
+    /// 探测目标端口是否已有服务在监听（短超时 TCP 连接）
+    fn port_listening(host: &str, port: u16) -> bool {
+        use std::net::{TcpStream, ToSocketAddrs};
+        let Ok(addrs) = (host, port).to_socket_addrs() else {
+            return false;
+        };
+        for addr in addrs {
+            if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 直接向 GUI 执行记录追加一条本地条目（服务未启动时也可用）
+    fn push_local_log(&mut self, kind: LogKind, summary: impl Into<String>) {
+        self.logs.push(LogEntry {
+            time: chrono::Local::now(),
+            kind,
+            source: "系统".to_string(),
+            session_key: String::new(),
+            summary: summary.into(),
+            detail: String::new(),
+        });
+    }
+
+    /// 启动服务前确保 cc-connect 可用：WS 端口已被监听则复用，否则自动拉起
+    fn ensure_cc_connect(&mut self) {
+        let Some((host, port)) = Self::ws_endpoint(&self.config.ws_url) else {
+            self.push_local_log(LogKind::Error, format!("WS 地址无法解析: {}", self.config.ws_url));
+            return;
+        };
+        if Self::port_listening(&host, port) {
+            self.push_local_log(
+                LogKind::System,
+                format!("🔍 检测到 {host}:{port} 已有服务监听，跳过启动 cc-connect"),
+            );
+            return;
+        }
+        self.start_cc_connect();
+        let note = match self.cc_connect_child.as_ref() {
+            Some(child) => format!("🚀 {host}:{port} 未被监听，已自动启动 cc-connect (PID {})", child.id()),
+            None => format!("❌ {host}:{port} 未被监听，且 cc-connect 启动失败: {}", self.status_message),
+        };
+        let kind = if self.cc_connect_child.is_some() { LogKind::System } else { LogKind::Error };
+        self.push_local_log(kind, note);
+    }
+
     fn start_service(&mut self) {
         if self.config.ws_url.trim().is_empty() {
             self.status_message = "请先在设置中填写 WS 地址".to_string();
             self.show_settings_window = true;
             return;
         }
+        // 启动服务包含启动 cc-connect：端口已监听则跳过
+        self.ensure_cc_connect();
+
         let (log_tx, log_rx) = std::sync::mpsc::channel();
         let conn_status = ConnStatus::new();
         self.service = Some(BridgeService::start(
@@ -178,6 +259,8 @@ impl AgentLoopApp {
         if let Some(mut svc) = self.service.take() {
             svc.stop();
         }
+        // 服务停止时一并回收由本应用拉起的 cc-connect（外部进程不受影响）
+        self.stop_cc_connect();
         self.conn_status = None;
         self.log_rx = None;
         self.is_running = false;
@@ -240,7 +323,8 @@ impl AgentLoopApp {
         }
     }
 
-    /// 渲染订阅编辑表单（新建弹窗与详情弹窗共用）
+    /// 渲染订阅编辑表单（新建弹窗与详情弹窗共用）。
+    /// 短字段两列一排，压缩弹窗高度。
     fn subscription_form(
         ui: &mut egui::Ui,
         sub: &mut Subscription,
@@ -248,84 +332,137 @@ impl AgentLoopApp {
         available_filters: &[String],
         id_suffix: &str,
     ) {
-        ui.label("名称");
-        ui.text_edit_singleline(&mut sub.name);
+        let full_line = |ui: &mut egui::Ui, text: &mut String| {
+            ui.add(egui::TextEdit::singleline(text).desired_width(ui.available_width()));
+        };
 
-        ui.add_space(8.0);
+        // 名称 | 工作区
+        ui.columns(2, |cols| {
+            cols[0].label("名称");
+            full_line(&mut cols[0], &mut sub.name);
+
+            cols[1].label("工作区（可选）");
+            let mut workspace = sub.workspace.clone().unwrap_or_default();
+            full_line(&mut cols[1], &mut workspace);
+            sub.workspace = if workspace.is_empty() { None } else { Some(workspace) };
+        });
+
+        ui.add_space(6.0);
 
         ui.label("Smee URL");
-        ui.text_edit_singleline(&mut sub.smee_url);
+        full_line(ui, &mut sub.smee_url);
 
-        ui.add_space(8.0);
+        ui.add_space(6.0);
 
         ui.label("基础提示词");
         ui.add_sized(
-            [ui.available_width(), 100.0],
+            [ui.available_width(), 80.0],
             egui::TextEdit::multiline(&mut sub.base_prompt),
         );
 
-        ui.add_space(8.0);
+        ui.add_space(6.0);
 
-        ui.label("工作区（可选）");
-        let mut workspace = sub.workspace.clone().unwrap_or_default();
-        ui.text_edit_singleline(&mut workspace);
-        sub.workspace = if workspace.is_empty() { None } else { Some(workspace) };
+        // Provider | Model
+        ui.columns(2, |cols| {
+            cols[0].label("Provider（可选）").on_hover_text("启动后执行 /provider switch <名称>");
+            let mut provider = sub.provider.clone().unwrap_or_default();
+            full_line(&mut cols[0], &mut provider);
+            sub.provider = if provider.trim().is_empty() { None } else { Some(provider) };
 
-        ui.add_space(8.0);
+            cols[1].label("Model（可选）").on_hover_text("启动后执行 /model switch <别名>");
+            let mut model = sub.model.clone().unwrap_or_default();
+            full_line(&mut cols[1], &mut model);
+            sub.model = if model.trim().is_empty() { None } else { Some(model) };
+        });
 
-        ui.label("Reporter");
-        let mut selected_reporter = sub.reporter.clone().unwrap_or_else(|| "console".to_string());
-        egui::ComboBox::from_id_salt(format!("reporter_{id_suffix}"))
-            .selected_text(&selected_reporter)
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                for reporter in available_reporters {
-                    ui.selectable_value(&mut selected_reporter, reporter.clone(), reporter);
-                }
-            });
-        sub.reporter = Some(selected_reporter);
+        ui.add_space(6.0);
 
-        ui.add_space(8.0);
-
-        ui.label("Filter");
+        // Reporter | Filter
         let mut selected_filter = sub.filter_regex.clone().unwrap_or_else(|| "none".to_string());
-        let display_text = if selected_filter == "none" {
-            "无过滤".to_string()
-        } else if selected_filter.starts_with("regex:") {
-            "自定义正则".to_string()
-        } else {
-            selected_filter.clone()
-        };
+        ui.columns(2, |cols| {
+            cols[0].label("Reporter");
+            let mut selected_reporter =
+                sub.reporter.clone().unwrap_or_else(|| "console".to_string());
+            egui::ComboBox::from_id_salt(format!("reporter_{id_suffix}"))
+                .selected_text(&selected_reporter)
+                .width(cols[0].available_width())
+                .show_ui(&mut cols[0], |ui| {
+                    for reporter in available_reporters {
+                        ui.selectable_value(&mut selected_reporter, reporter.clone(), reporter);
+                    }
+                });
+            sub.reporter = Some(selected_reporter);
 
-        egui::ComboBox::from_id_salt(format!("filter_{id_suffix}"))
-            .selected_text(display_text)
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                if ui.selectable_label(selected_filter == "none", "无过滤").clicked() {
-                    selected_filter = "none".to_string();
-                }
-                if ui.selectable_label(selected_filter.starts_with("regex:"), "自定义正则").clicked() {
-                    selected_filter = "regex:".to_string();
-                }
-                for filter in available_filters {
-                    if filter != "none" && filter != "regex" {
-                        if ui.selectable_label(selected_filter == *filter, filter).clicked() {
+            cols[1].label("Filter");
+            let display_text = if selected_filter == "none" {
+                "无过滤".to_string()
+            } else if selected_filter.starts_with("regex:") {
+                "自定义正则".to_string()
+            } else {
+                selected_filter.clone()
+            };
+            egui::ComboBox::from_id_salt(format!("filter_{id_suffix}"))
+                .selected_text(display_text)
+                .width(cols[1].available_width())
+                .show_ui(&mut cols[1], |ui| {
+                    if ui.selectable_label(selected_filter == "none", "无过滤").clicked() {
+                        selected_filter = "none".to_string();
+                    }
+                    if ui.selectable_label(selected_filter.starts_with("regex:"), "自定义正则").clicked() {
+                        selected_filter = "regex:".to_string();
+                    }
+                    for filter in available_filters {
+                        if filter != "none"
+                            && filter != "regex"
+                            && ui.selectable_label(selected_filter == *filter, filter).clicked()
+                        {
                             selected_filter = filter.clone();
                         }
                     }
-                }
-            });
+                });
+        });
 
         if selected_filter.starts_with("regex:") {
             ui.add_space(4.0);
-            ui.label("正则表达式");
-            let mut regex_input = selected_filter.strip_prefix("regex:").unwrap_or("").to_string();
-            if ui.text_edit_singleline(&mut regex_input).changed() {
-                selected_filter = format!("regex:{}", regex_input);
+            ui.label("正则条件（AND 关系，最多 3 个，全部命中才放行；留空的忽略）");
+            let body = selected_filter.strip_prefix("regex:").unwrap_or("");
+            let mut parts: Vec<String> =
+                body.split("&&").map(|s| s.trim().to_string()).collect();
+            parts.resize(3, String::new());
+            let mut changed = false;
+            for (i, part) in parts.iter_mut().enumerate() {
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(part)
+                            .desired_width(ui.available_width())
+                            .hint_text(format!("条件 {}（如 @claudecode01）", i + 1)),
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+            }
+            if changed {
+                // 保留中间空条件的位置（避免输入框内容跳位），只裁掉尾部空条件；
+                // 空段在 apply_filters 中会被忽略
+                let mut segs: Vec<&str> = parts.iter().map(|s| s.trim()).collect();
+                while segs.len() > 1 && segs.last() == Some(&"") {
+                    segs.pop();
+                }
+                selected_filter = format!("regex:{}", segs.join(" && "));
             }
         }
 
         sub.filter_regex = if selected_filter == "none" { None } else { Some(selected_filter) };
+    }
+}
+
+impl Drop for AgentLoopApp {
+    fn drop(&mut self) {
+        // 窗口关闭时回收后台服务与本应用拉起的 cc-connect 子进程；
+        // std::process::Child 被 drop 不会终止进程，必须显式 kill
+        self.stop_service();
+        self.stop_cc_connect();
     }
 }
 
@@ -489,7 +626,15 @@ impl eframe::App for AgentLoopApp {
                 ui.checkbox(&mut self.show_webhook_logs, "📨 Webhook");
                 ui.checkbox(&mut self.show_result_logs, "✅ 执行结果");
                 ui.checkbox(&mut self.show_system_logs, "⚙ 系统");
-                ui.add_space((ui.available_width() - 65.0).max(0.0));
+                ui.add_space((ui.available_width() - 135.0).max(0.0));
+                if ui
+                    .add_sized([60.0, 24.0], egui::Button::new("📤 指令"))
+                    .on_hover_text("向某个订阅的会话发送指令（card_action）")
+                    .clicked()
+                {
+                    self.show_command_dialog = true;
+                }
+                ui.add_space(4.0);
                 if ui.add_sized([60.0, 24.0], egui::Button::new("清空")).clicked() {
                     self.logs.clear();
                 }
@@ -497,24 +642,33 @@ impl eframe::App for AgentLoopApp {
             ui.add_space(4.0);
             ui.separator();
 
+            // 只渲染最近 20 条可见记录，避免长时间运行后日志过多造成渲染压力
+            // （内存中仍保留最近 1000 条，切换筛选类型时各自取最近 20 条）
+            const MAX_VISIBLE_LOGS: usize = 20;
+
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.add_space(4.0);
-                    let mut shown = 0usize;
-                    for (idx, entry) in self.logs.iter().enumerate() {
-                        let visible = match entry.kind {
+                    let visible_entries: Vec<(usize, &LogEntry)> = self
+                        .logs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, entry)| match entry.kind {
                             LogKind::Webhook => self.show_webhook_logs,
                             LogKind::Result => self.show_result_logs,
                             LogKind::System => self.show_system_logs,
                             LogKind::Error => true, // 错误始终展示
-                        };
-                        if !visible {
-                            continue;
-                        }
-                        shown += 1;
-
+                        })
+                        .collect();
+                    let shown = visible_entries.len().min(MAX_VISIBLE_LOGS);
+                    let skipped = visible_entries.len() - shown;
+                    if skipped > 0 {
+                        ui.weak(format!("… 已省略较早的 {skipped} 条，仅展示最近 {MAX_VISIBLE_LOGS} 条"));
+                        ui.add_space(2.0);
+                    }
+                    for &(idx, entry) in visible_entries.iter().skip(skipped) {
                         let (icon, color) = match entry.kind {
                             LogKind::Webhook => ("📨", egui::Color32::from_rgb(100, 181, 246)),
                             LogKind::Result => ("✅", egui::Color32::from_rgb(46, 204, 113)),
@@ -529,6 +683,15 @@ impl eframe::App for AgentLoopApp {
                                     .weak(),
                             );
                             ui.colored_label(color, format!("{icon} [{}]", entry.source));
+                            if !entry.session_key.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(format!("🔑 {}", entry.session_key))
+                                        .monospace()
+                                        .weak()
+                                        .size(11.0),
+                                )
+                                .on_hover_text("Bridge 会话 Session Key（同一订阅共用，保留上下文）");
+                            }
                             ui.label(&entry.summary);
                         });
 
@@ -560,6 +723,115 @@ impl eframe::App for AgentLoopApp {
                     }
                 });
         });
+
+        // 指令弹窗：选择订阅会话，发送任意 card_action 指令
+        if self.show_command_dialog {
+            let mut open = true;
+            let mut send_clicked = false;
+            egui::Window::new("📤 发送指令")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_width(420.0);
+
+                    ui.label("目标订阅");
+                    if self.config.subscriptions.is_empty() {
+                        ui.weak("暂无订阅，请先创建");
+                    } else {
+                        if self.command_target >= self.config.subscriptions.len() {
+                            self.command_target = 0;
+                        }
+                        let current_name =
+                            self.config.subscriptions[self.command_target].name.clone();
+                        egui::ComboBox::from_id_salt("command_target")
+                            .selected_text(&current_name)
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                for (i, s) in self.config.subscriptions.iter().enumerate() {
+                                    ui.selectable_value(&mut self.command_target, i, &s.name);
+                                }
+                            });
+                        ui.label(
+                            egui::RichText::new(BridgeService::session_key_for(
+                                &self.config.subscriptions[self.command_target].name,
+                            ))
+                            .monospace()
+                            .weak()
+                            .size(11.0),
+                        );
+                    }
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("类型");
+                        ui.selectable_value(&mut self.command_send_message, false, "指令")
+                            .on_hover_text("发送 card_action 引擎命令，回执以 📩 记入执行记录");
+                        ui.selectable_value(&mut self.command_send_message, true, "消息")
+                            .on_hover_text("以用户身份推送一段话，走正常 message 执行流程");
+                    });
+
+                    ui.add_space(8.0);
+                    let enter_pressed = if self.command_send_message {
+                        ui.label("消息内容");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.command_input)
+                                .desired_width(ui.available_width())
+                                .desired_rows(4)
+                                .hint_text("要推送给 agent 的一段话"),
+                        );
+                        false // 多行输入回车用于换行，不触发发送
+                    } else {
+                        ui.label("指令");
+                        let input = ui.add(
+                            egui::TextEdit::singleline(&mut self.command_input)
+                                .desired_width(ui.available_width())
+                                .hint_text("如 /model switch k2、/dir /tmp、/current"),
+                        );
+                        input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    };
+
+                    ui.add_space(12.0);
+                    let can_send = self.is_running
+                        && !self.config.subscriptions.is_empty()
+                        && !self.command_input.trim().is_empty();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(can_send, egui::Button::new("📤 发送"))
+                            .on_disabled_hover_text(if self.is_running {
+                                "请选择订阅并输入指令"
+                            } else {
+                                "启动服务后才能发送指令"
+                            })
+                            .clicked()
+                            || (can_send && enter_pressed)
+                        {
+                            send_clicked = true;
+                        }
+                    });
+                });
+
+            if send_clicked {
+                if let Some(svc) = &self.service {
+                    let name = self.config.subscriptions[self.command_target].name.clone();
+                    if self.command_send_message {
+                        svc.send_message(&name, self.command_input.trim());
+                        self.status_message = format!("消息已推送 → {name}");
+                    } else {
+                        let key = BridgeService::session_key_for(&name);
+                        let action = Self::command_action(&self.command_input);
+                        svc.send_command(&key, &action);
+                        self.status_message = format!("指令已发送: {action} → {name}");
+                    }
+                    self.command_input.clear();
+                    self.show_command_dialog = false;
+                }
+            }
+            if !open {
+                self.show_command_dialog = false;
+            }
+        }
 
         // 设置弹窗（连接配置不常变更，收进这里）
         if self.show_settings_window {
@@ -599,23 +871,11 @@ impl eframe::App for AgentLoopApp {
                     ui.add_space(8.0);
 
                     ui.label("cc-connect 启动命令");
-                    let cc_running = self.cc_connect_running();
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.config.cc_connect_command)
-                                .desired_width(ui.available_width() - 150.0),
-                        );
-                        if cc_running {
-                            if ui.add_sized([140.0, 24.0], egui::Button::new("🛑 停止 cc-connect")).clicked() {
-                                self.stop_cc_connect();
-                            }
-                        } else if ui.add_sized([140.0, 24.0], egui::Button::new("▶ 启动 cc-connect")).clicked() {
-                            self.start_cc_connect();
-                        }
-                    });
-                    if cc_running {
-                        ui.colored_label(egui::Color32::from_rgb(46, 204, 113), "● cc-connect 运行中");
-                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.config.cc_connect_command)
+                            .desired_width(ui.available_width()),
+                    );
+                    ui.weak("启动服务时自动检测：WS 端口未被监听才会用此命令拉起 cc-connect");
 
                     ui.add_space(12.0);
                     ui.separator();
@@ -634,28 +894,60 @@ impl eframe::App for AgentLoopApp {
         let mut delete_selected = false;
         let mut close_detail = false;
         let mut save_detail = false;
+        let mut clear_session_clicked = false;
         if let Some(idx) = self.selected_subscription {
             if idx >= self.config.subscriptions.len() {
                 self.selected_subscription = None;
             } else {
                 let available_reporters = &self.available_reporters;
                 let available_filters = &self.available_filters;
+                let service_running = self.is_running;
                 let sub = &mut self.config.subscriptions[idx];
                 egui::Window::new("订阅详情")
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    // 内容超过窗口高度时出现滚动条，弹窗不超出屏幕
+                    .max_height(ctx.screen_rect().height() - 120.0)
+                    .vscroll(true)
                     .show(ctx, |ui| {
                         ui.set_width(480.0);
 
                         Self::subscription_form(ui, sub, available_reporters, available_filters, "detail");
 
-                        ui.add_space(12.0);
-                        ui.checkbox(&mut sub.enabled, "启用此订阅");
-
-                        ui.add_space(16.0);
-                        ui.separator();
                         ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+
+                        // 启用开关 + 会话上下文操作放同一排
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut sub.enabled, "启用此订阅");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let btn = egui::Button::new("🧹 清除上下文");
+                                if ui
+                                    .add_enabled(service_running, btn)
+                                    .on_hover_text("向 cc-connect 发送 card_action `cmd:/new`，\n开启新会话并重新下发初始化命令")
+                                    .on_disabled_hover_text("启动服务后可清除会话上下文")
+                                    .clicked()
+                                {
+                                    clear_session_clicked = true;
+                                }
+                            });
+                        });
+                        // 同一订阅固定 session key，cc-connect 侧保留上下文
+                        ui.horizontal(|ui| {
+                            ui.weak("会话:");
+                            ui.label(
+                                egui::RichText::new(BridgeService::session_key_for(&sub.name))
+                                    .monospace()
+                                    .weak()
+                                    .size(11.0),
+                            );
+                        });
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(6.0);
 
                         ui.horizontal(|ui| {
                             if ui.add_sized([60.0, 28.0], egui::Button::new("🗑 删除")).clicked() {
@@ -675,6 +967,13 @@ impl eframe::App for AgentLoopApp {
             }
         }
 
+        if clear_session_clicked {
+            if let (Some(svc), Some(idx)) = (&self.service, self.selected_subscription) {
+                let key = BridgeService::session_key_for(&self.config.subscriptions[idx].name);
+                svc.clear_session(&key);
+                self.status_message = format!("已发送清除上下文指令: {key}");
+            }
+        }
         if delete_selected {
             if let Some(idx) = self.selected_subscription {
                 self.config.subscriptions.remove(idx);
@@ -695,6 +994,8 @@ impl eframe::App for AgentLoopApp {
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .max_height(ctx.screen_rect().height() - 120.0)
+                .vscroll(true)
                 .show(ctx, |ui| {
                     ui.set_width(480.0);
 

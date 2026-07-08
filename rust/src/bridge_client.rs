@@ -4,9 +4,11 @@
 //!
 //! 按 bridge-protocol.zh-CN.md 实现：
 //! - token 认证（URL 查询参数 `?token=...`）
-//! - `register` / `register_ack` 握手，metadata 中声明 `permission_mode: bypassPermissions`
+//! - `register` / `register_ack` 握手
+//! - 注册成功后对每个已知会话发送 `card_action` `cmd:/mode bypassPermissions`，
+//!   将权限模式切到全自动（register metadata 无法设置权限模式）
 //! - 每 30 秒发送 `ping` 心跳
-//! - 断线指数退避重连（1s 起步，最大 60s）
+//! - 断线指数退避重连（1s 起步，最大 60s），重连后重新下发权限模式
 //! - 只声明 `text` / `buttons` 能力：不接收执行过程，只等待最终 `reply`
 //! - 收到权限确认按钮时自动回复「允许」（bypassPermissions 行为兜底）
 
@@ -35,6 +37,19 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BACKOFF_SECS: u64 = 60;
+
+/// 切换到全自动权限模式的引擎命令（通过 card_action 下发）
+pub const MODE_BYPASS_ACTION: &str = "cmd:/mode bypassPermissions";
+/// 清空会话上下文、开启新会话的引擎命令
+pub const NEW_SESSION_ACTION: &str = "cmd:/new";
+
+/// 每次（重）连注册成功后需要对某个会话下发的初始化命令
+#[derive(Debug, Clone)]
+pub struct SessionInit {
+    pub session_key: String,
+    /// card_action 序列，如 `cmd:/mode bypassPermissions`、`cmd:/provider switch kimi`
+    pub actions: Vec<String>,
+}
 
 /// 与 cc-connect 的连接状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,23 +89,43 @@ struct AskCmd {
     respond: oneshot::Sender<Result<String>>,
 }
 
+/// GUI/服务下发给连接 actor 的指令
+enum Cmd {
+    /// 发送 `message` 并等待最终 `reply`
+    Ask(AskCmd),
+    /// 发送 `card_action`（如 `cmd:/new`、`cmd:/mode bypassPermissions`），不等待回复
+    CardAction { session_key: String, action: String },
+}
+
 /// Bridge 客户端句柄。可跨任务 Clone，内部由单个 actor 管理连接。
 #[derive(Clone)]
 pub struct BridgeClient {
-    cmd_tx: mpsc::UnboundedSender<AskCmd>,
+    cmd_tx: mpsc::UnboundedSender<Cmd>,
 }
 
 impl BridgeClient {
-    /// 在当前 tokio runtime 上启动客户端 actor（自动重连，直到 runtime 结束）
+    /// 在当前 tokio runtime 上启动客户端 actor（自动重连，直到 runtime 结束）。
+    ///
+    /// `init_sessions`：每次（重）连注册成功后，对这些会话依次下发各自的
+    /// 初始化命令（权限模式 / provider / model 等）。
     pub fn spawn(
         ws_url: String,
         token: String,
         platform: String,
+        init_sessions: Vec<SessionInit>,
         log: Log,
         status: ConnStatus,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_actor(ws_url, token, platform, cmd_rx, log, status));
+        tokio::spawn(run_actor(
+            ws_url,
+            token,
+            platform,
+            init_sessions,
+            cmd_rx,
+            log,
+            status,
+        ));
         Self { cmd_tx }
     }
 
@@ -104,13 +139,13 @@ impl BridgeClient {
     ) -> Result<String> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(AskCmd {
+            .send(Cmd::Ask(AskCmd {
                 session_key: session_key.to_string(),
                 user_id: user_id.to_string(),
                 user_name: user_name.to_string(),
                 content: content.to_string(),
                 respond: tx,
-            })
+            }))
             .map_err(|_| anyhow!("Bridge 客户端已停止"))?;
 
         match tokio::time::timeout(REPLY_TIMEOUT, rx).await {
@@ -119,6 +154,39 @@ impl BridgeClient {
             Ok(Ok(result)) => result,
         }
     }
+
+    /// 发送 `card_action`（fire-and-forget）。连接断开时指令会排队，重连后发出。
+    pub fn card_action(&self, session_key: &str, action: &str) {
+        let _ = self.cmd_tx.send(Cmd::CardAction {
+            session_key: session_key.to_string(),
+            action: action.to_string(),
+        });
+    }
+}
+
+/// 首次连接前等待 WS 端口就绪：cc-connect 可能刚被本应用拉起，
+/// 直接连必然吃一次 Connection refused。端口已在监听则立即返回。
+async fn wait_for_port(ws_url: &str, log: &Log) {
+    let Some((host, port)) = url::Url::parse(ws_url)
+        .ok()
+        .and_then(|u| Some((u.host_str()?.to_string(), u.port_or_known_default()?)))
+    else {
+        return; // 地址解析失败交由正常连接流程报错
+    };
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut logged = false;
+    while tokio::net::TcpStream::connect((host.as_str(), port)).await.is_err() {
+        if !logged {
+            log.system(format!("⏳ 等待 cc-connect 端口就绪（{host}:{port}）..."));
+            logged = true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            log.system("⚠️ 等待端口就绪超时，转入正常重连流程");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// 连接管理主循环：连接 → 注册 → 服务，断开后指数退避重连
@@ -126,10 +194,12 @@ async fn run_actor(
     ws_url: String,
     token: String,
     platform: String,
-    mut cmd_rx: mpsc::UnboundedReceiver<AskCmd>,
+    init_sessions: Vec<SessionInit>,
+    mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     log: Log,
     status: ConnStatus,
 ) {
+    wait_for_port(&ws_url, &log).await;
     let mut backoff = 1u64;
     loop {
         status.set(ConnState::Connecting);
@@ -137,11 +207,9 @@ async fn run_actor(
         match connect_and_register(&ws_url, &token, &platform).await {
             Ok(ws) => {
                 status.set(ConnState::Connected);
-                log.system(format!(
-                    "✅ 已注册到 cc-connect（platform: {platform}, 权限模式: bypassPermissions）"
-                ));
+                log.system(format!("✅ 已注册到 cc-connect（platform: {platform}）"));
                 backoff = 1;
-                let served = serve_connection(ws, &mut cmd_rx, &log).await;
+                let served = serve_connection(ws, &init_sessions, &mut cmd_rx, &log).await;
                 status.set(ConnState::Disconnected);
                 match served {
                     Ok(()) => {
@@ -185,12 +253,11 @@ async fn connect_and_register(ws_url: &str, token: &str, platform: &str) -> Resu
         // 只声明 text/buttons：不接收流式执行过程，只要最终结果；
         // buttons 用于自动允许权限确认。
         capabilities: vec!["text".to_string(), "buttons".to_string()],
+        // metadata 仅用于日志/调试，权限模式在注册后通过 card_action `/mode` 设置
         metadata: json!({
             "protocol_version": 1,
             "version": env!("CARGO_PKG_VERSION"),
             "description": "Agent Loop Bridge 适配器",
-            // 要求 cc-connect 以最宽泛权限运行 agent（等价 --dangerously-skip-permissions）
-            "permission_mode": "bypassPermissions",
         }),
     };
     ws.send(Message::Text(serde_json::to_string(&register)?))
@@ -214,12 +281,39 @@ async fn connect_and_register(ws_url: &str, token: &str, platform: &str) -> Resu
     }
 }
 
+/// 发送一条 card_action（reply_ctx 随机生成，回复按未匹配推送记入日志）
+async fn send_card_action(ws: &mut WsStream, session_key: &str, action: &str) -> Result<()> {
+    let msg = Outbound::CardAction {
+        session_key: session_key.to_string(),
+        action: action.to_string(),
+        reply_ctx: Uuid::new_v4().to_string(),
+    };
+    ws.send(Message::Text(serde_json::to_string(&msg)?))
+        .await
+        .map_err(|e| anyhow!("发送 card_action 失败: {e}"))
+}
+
 /// 单条连接的消息收发循环。返回 Ok(()) 表示客户端被要求停止，Err 表示连接断开需重连。
 async fn serve_connection(
     mut ws: WsStream,
-    cmd_rx: &mut mpsc::UnboundedReceiver<AskCmd>,
+    init_sessions: &[SessionInit],
+    cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
     log: &Log,
 ) -> Result<()> {
+    // register metadata 无法设置权限模式等，注册成功后逐会话下发初始化命令
+    for session in init_sessions {
+        for action in &session.actions {
+            send_card_action(&mut ws, &session.session_key, action).await?;
+        }
+        log.push_for(
+            LogKind::System,
+            "cc-connect",
+            session.session_key.clone(),
+            format!("🔓 已下发会话初始化命令: {}", session.actions.join("、")),
+            "",
+        );
+    }
+
     let mut pending: PendingMap = HashMap::new();
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -228,26 +322,42 @@ async fn serve_connection(
     let result: Result<()> = loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
-                let Some(cmd) = cmd else { break Ok(()) };
-                let reply_ctx = Uuid::new_v4().to_string();
-                let msg = Outbound::Message {
-                    msg_id: Uuid::new_v4().to_string(),
-                    session_key: cmd.session_key,
-                    user_id: cmd.user_id,
-                    user_name: cmd.user_name,
-                    content: cmd.content,
-                    reply_ctx: reply_ctx.clone(),
-                };
-                match serde_json::to_string(&msg) {
-                    Ok(json) => {
-                        if let Err(e) = ws.send(Message::Text(json)).await {
-                            let _ = cmd.respond.send(Err(anyhow!("消息发送失败: {e}")));
-                            break Err(anyhow!("WebSocket 发送失败: {e}"));
+                match cmd {
+                    None => break Ok(()),
+                    Some(Cmd::CardAction { session_key, action }) => {
+                        if let Err(e) = send_card_action(&mut ws, &session_key, &action).await {
+                            break Err(e);
                         }
-                        pending.insert(reply_ctx, cmd.respond);
+                        log.push_for(
+                            LogKind::System,
+                            "cc-connect",
+                            session_key,
+                            format!("📤 已发送 card_action: {action}"),
+                            "",
+                        );
                     }
-                    Err(e) => {
-                        let _ = cmd.respond.send(Err(anyhow!("消息序列化失败: {e}")));
+                    Some(Cmd::Ask(cmd)) => {
+                        let reply_ctx = Uuid::new_v4().to_string();
+                        let msg = Outbound::Message {
+                            msg_id: Uuid::new_v4().to_string(),
+                            session_key: cmd.session_key,
+                            user_id: cmd.user_id,
+                            user_name: cmd.user_name,
+                            content: cmd.content,
+                            reply_ctx: reply_ctx.clone(),
+                        };
+                        match serde_json::to_string(&msg) {
+                            Ok(json) => {
+                                if let Err(e) = ws.send(Message::Text(json)).await {
+                                    let _ = cmd.respond.send(Err(anyhow!("消息发送失败: {e}")));
+                                    break Err(anyhow!("WebSocket 发送失败: {e}"));
+                                }
+                                pending.insert(reply_ctx, cmd.respond);
+                            }
+                            Err(e) => {
+                                let _ = cmd.respond.send(Err(anyhow!("消息序列化失败: {e}")));
+                            }
+                        }
                     }
                 }
             }
@@ -303,28 +413,45 @@ async fn handle_inbound(
     };
 
     match inbound {
-        Inbound::Reply { reply_ctx, content, .. } => {
-            if let Some(tx) = pending.remove(&reply_ctx) {
+        Inbound::Reply { session_key, reply_ctx, content } => {
+            // cc-connect 会把 Claude 的思考过程以 💭 前缀的 reply 提前推送，
+            // 且与最终回复共用 reply_ctx——只记录，不当作执行结果，继续等待
+            if content.trim_start().starts_with("💭") {
+                let summary = format!("💭 思考过程: {}", truncate(content.trim_start(), 120));
+                log.push_for(LogKind::System, "cc-connect", session_key, summary, content);
+            } else if let Some(tx) = pending.remove(&reply_ctx) {
                 let _ = tx.send(Ok(content));
             } else {
-                // 主动推送（如心跳/定时任务消息），仅记录
+                // 主动推送（命令回执、心跳/定时任务消息等），仅记录
                 let summary = format!("📩 {}", truncate(&content, 120));
-                log.push(LogKind::System, "cc-connect", summary, content);
+                log.push_for(LogKind::System, "cc-connect", session_key, summary, content);
             }
         }
         Inbound::Buttons { session_key, reply_ctx, content, buttons } => {
-            // bypassPermissions：自动点击「允许」类按钮
+            // bypassPermissions 兜底：自动点击「允许」类按钮
             if let Some(action) = pick_allow_action(&buttons) {
-                log.system(format!("🔓 自动允许权限请求: {}", truncate(&content, 120)));
+                log.push_for(
+                    LogKind::System,
+                    "cc-connect",
+                    session_key.clone(),
+                    format!("🔓 自动允许权限请求: {}", truncate(&content, 120)),
+                    "",
+                );
                 let msg = Outbound::CardAction { session_key, action, reply_ctx };
                 ws.send(Message::Text(serde_json::to_string(&msg)?))
                     .await
                     .map_err(|e| anyhow!("发送 card_action 失败: {e}"))?;
             } else {
-                log.system(format!(
-                    "⚠️ 收到无法自动处理的按钮消息，已忽略: {}",
-                    truncate(&content, 120)
-                ));
+                log.push_for(
+                    LogKind::System,
+                    "cc-connect",
+                    session_key,
+                    format!(
+                        "⚠️ 收到无法自动处理的按钮消息，已忽略: {}",
+                        truncate(&content, 120)
+                    ),
+                    "",
+                );
             }
         }
         Inbound::Error { code, message } => {
@@ -373,8 +500,8 @@ mod tests {
         Request, Response as HsResponse,
     };
 
-    /// 端到端：token 认证 → register（bypassPermissions）→ message →
-    /// 权限按钮自动允许 → 最终 reply
+    /// 端到端：token 认证 → register → card_action 设置 bypassPermissions →
+    /// message → 权限按钮自动允许 → 最终 reply → card_action /new 清除上下文
     #[tokio::test]
     async fn ask_round_trip_with_mock_cc_connect() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -383,23 +510,30 @@ mod tests {
 
         let uri_capture = seen_uri.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_hdr_async(
-                stream,
-                move |req: &Request, resp: HsResponse| {
-                    *uri_capture.lock().unwrap() = req.uri().to_string();
-                    Ok(resp)
-                },
-            )
-            .await
-            .unwrap();
+            // 客户端会先用 TCP 探测端口就绪（wait_for_port），该连接不做 WS 握手
+            // 即断开——循环 accept 直到收到真正的 WebSocket 握手
+            let mut ws = loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let capture = uri_capture.clone();
+                match tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    move |req: &Request, resp: HsResponse| {
+                        *capture.lock().unwrap() = req.uri().to_string();
+                        Ok(resp)
+                    },
+                )
+                .await
+                {
+                    Ok(ws) => break ws,
+                    Err(_) => continue,
+                }
+            };
 
-            // 1. register：校验能力与权限模式
+            // 1. register：校验能力
             let raw = ws.next().await.unwrap().unwrap().into_text().unwrap();
             let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
             assert_eq!(v["type"], "register");
             assert_eq!(v["platform"], "agent-loop");
-            assert_eq!(v["metadata"]["permission_mode"], "bypassPermissions");
             assert_eq!(v["metadata"]["protocol_version"], 1);
             let caps: Vec<&str> = v["capabilities"]
                 .as_array()
@@ -416,7 +550,20 @@ mod tests {
             .await
             .unwrap();
 
-            // 2. message
+            // 2. 注册成功后应依次收到会话初始化 card_action（mode / provider / model）
+            for expected in [
+                "cmd:/mode bypassPermissions",
+                "cmd:/provider switch kimi",
+                "cmd:/model switch k2",
+            ] {
+                let raw = ws.next().await.unwrap().unwrap().into_text().unwrap();
+                let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(v["type"], "card_action");
+                assert_eq!(v["session_key"], "agent-loop:t-abc:t-abc");
+                assert_eq!(v["action"], expected);
+            }
+
+            // 3. message
             let raw = ws.next().await.unwrap().unwrap().into_text().unwrap();
             let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
             assert_eq!(v["type"], "message");
@@ -424,7 +571,7 @@ mod tests {
             let session_key = v["session_key"].as_str().unwrap().to_string();
             let reply_ctx = v["reply_ctx"].as_str().unwrap().to_string();
 
-            // 3. 权限确认按钮 → 客户端应自动回 card_action 允许
+            // 4. 权限确认按钮 → 客户端应自动回 card_action 允许
             ws.send(Message::Text(
                 serde_json::json!({
                     "type": "buttons",
@@ -445,7 +592,21 @@ mod tests {
             assert_eq!(v["type"], "card_action");
             assert_eq!(v["action"], "perm:req-1:allow");
 
-            // 4. 最终结果
+            // 5. 思考过程（💭 前缀、共用 reply_ctx）→ 客户端应忽略并继续等待
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "reply",
+                    "session_key": session_key,
+                    "reply_ctx": reply_ctx,
+                    "content": "💭 用户想要……我直接回复即可。",
+                    "format": "text"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+
+            // 6. 最终结果
             ws.send(Message::Text(
                 serde_json::json!({
                     "type": "reply",
@@ -458,6 +619,12 @@ mod tests {
             ))
             .await
             .unwrap();
+
+            // 7. 清除上下文 → 应收到 card_action cmd:/new
+            let raw = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(v["type"], "card_action");
+            assert_eq!(v["action"], "cmd:/new");
         });
 
         let (log_tx, _log_rx) = std::sync::mpsc::channel();
@@ -466,6 +633,14 @@ mod tests {
             format!("ws://{addr}/bridge/ws"),
             "secret-token".to_string(),
             "agent-loop".to_string(),
+            vec![SessionInit {
+                session_key: "agent-loop:t-abc:t-abc".to_string(),
+                actions: vec![
+                    MODE_BYPASS_ACTION.to_string(),
+                    "cmd:/provider switch kimi".to_string(),
+                    "cmd:/model switch k2".to_string(),
+                ],
+            }],
             Log::new(log_tx),
             status.clone(),
         );
@@ -475,6 +650,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "任务完成");
+        client.card_action("agent-loop:t-abc:t-abc", NEW_SESSION_ACTION);
         // 收到回复时连接必然已建立过
         assert_ne!(status.get(), ConnState::Connecting);
 

@@ -22,6 +22,8 @@ pub struct LogEntry {
     pub kind: LogKind,
     /// 来源：订阅名、"cc-connect" 或 "系统"
     pub source: String,
+    /// 关联的 Bridge 会话（`{platform}:{scope}:{user}`），无关联时为空
+    pub session_key: String,
     /// 单行摘要
     pub summary: String,
     /// 可折叠详情（Webhook 原始数据 / 完整执行结果），可为空
@@ -44,10 +46,23 @@ impl Log {
         summary: impl Into<String>,
         detail: impl Into<String>,
     ) {
+        self.push_for(kind, source, "", summary, detail);
+    }
+
+    /// 携带会话标识的日志条目（GUI 中展示 session key）
+    pub fn push_for(
+        &self,
+        kind: LogKind,
+        source: impl Into<String>,
+        session_key: impl Into<String>,
+        summary: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
         let entry = LogEntry {
             time: Local::now(),
             kind,
             source: source.into(),
+            session_key: session_key.into(),
             summary: summary.into(),
             detail: detail.into(),
         };

@@ -9,6 +9,12 @@ pub struct Subscription {
     pub workspace: Option<String>,
     pub reporter: Option<String>,
     pub filter_regex: Option<String>,
+    /// 可选：服务启动后对该会话执行 `/provider switch <名称>`
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// 可选：服务启动后对该会话执行 `/model switch <别名>`
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl Default for Subscription {
@@ -21,6 +27,8 @@ impl Default for Subscription {
             workspace: None,
             reporter: Some("console".to_string()),
             filter_regex: None,
+            provider: None,
+            model: None,
         }
     }
 }
