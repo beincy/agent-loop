@@ -1,5 +1,10 @@
 //! GUI 后台服务：smee 订阅 → 过滤 → 转发 cc-connect 执行 → 汇报结果
 //!
+//! 项目隔离模型：本应用以单一 platform（`agent-loop`）维持一条 Bridge 连接，
+//! 每个订阅是其下的独立会话（session_key 互不相同，上下文隔离）；
+//! cc-connect 按消息级 `project` 字段路由项目 engine（register 的 project
+//! 字段被服务端忽略），因此每条 message / card_action 都盖上订阅绑定的项目。
+//!
 //! 在独立线程上运行 tokio runtime，GUI 通过 watch 通道下发停止信号、
 //! 通过 std::sync::mpsc 接收日志。
 
@@ -10,9 +15,7 @@ use tokio::sync::{mpsc, watch};
 
 use std::collections::HashMap;
 
-use crate::bridge_client::{
-    BridgeClient, ConnStatus, SessionInit, MODE_BYPASS_ACTION, NEW_SESSION_ACTION,
-};
+use crate::bridge_client::{BridgeClient, ConnStatus, SessionBinding, NEW_SESSION_ACTION};
 use crate::event_log::{Log, LogEntry, LogKind};
 use crate::executor::build_prompt;
 use crate::filter::apply_filters;
@@ -128,26 +131,30 @@ async fn run_service(
         log.system("⚠️ 没有启用的订阅，仅维持与 cc-connect 的连接");
     }
 
-    // 每次（重）连注册成功后，客户端对这些会话下发初始化命令
-    // （bypassPermissions + 可选的 provider / model 切换）
-    let init_sessions: Vec<SessionInit> = enabled
+    // 会话与项目的绑定：该会话所有出站消息按此路由。
+    // 权限模式由 cc-connect 项目配置（mode = "bypassPermissions"）决定，无需下发
+    let sessions: Vec<SessionBinding> = enabled
         .iter()
-        .map(|s| SessionInit {
+        .map(|s| SessionBinding {
             session_key: BridgeService::session_key_for(&s.name),
-            actions: session_init_actions(s),
+            project: project_of(s),
         })
         .collect();
-    // 清除上下文后按会话重新下发同一组命令
-    let actions_by_session: HashMap<String, Vec<String>> = init_sessions
+    // GUI 控制指令按 session_key / 订阅名找回项目
+    let project_by_session: HashMap<String, Option<String>> = sessions
         .iter()
-        .map(|s| (s.session_key.clone(), s.actions.clone()))
+        .map(|s| (s.session_key.clone(), s.project.clone()))
+        .collect();
+    let project_by_name: HashMap<String, Option<String>> = enabled
+        .iter()
+        .map(|s| (s.name.clone(), project_of(s)))
         .collect();
 
     let bridge = BridgeClient::spawn(
         config.ws_url.clone(),
         config.bridge_token.trim().to_string(),
         PLATFORM.to_string(),
-        init_sessions,
+        sessions,
         log.clone(),
         conn_status,
     );
@@ -163,6 +170,7 @@ async fn run_service(
         while let Some(cmd) = ctrl_rx.recv().await {
             match cmd {
                 CtrlCmd::ClearSession { session_key } => {
+                    let project = project_by_session.get(&session_key).cloned().flatten();
                     ctrl_log.push_for(
                         LogKind::System,
                         "系统",
@@ -170,20 +178,15 @@ async fn run_service(
                         "🧹 请求清除会话上下文（/new）",
                         "",
                     );
-                    ctrl_bridge.card_action(&session_key, NEW_SESSION_ACTION);
-                    // 新会话的权限模式 / provider / model 未知，重新下发初始化命令
-                    let actions = actions_by_session
-                        .get(&session_key)
-                        .cloned()
-                        .unwrap_or_else(|| vec![MODE_BYPASS_ACTION.to_string()]);
-                    for action in actions {
-                        ctrl_bridge.card_action(&session_key, &action);
-                    }
+                    // 权限模式是项目级配置，新会话自动继承，无需重新下发
+                    ctrl_bridge.card_action(&session_key, project.as_deref(), NEW_SESSION_ACTION);
                 }
                 CtrlCmd::CardAction { session_key, action } => {
-                    ctrl_bridge.card_action(&session_key, &action);
+                    let project = project_by_session.get(&session_key).cloned().flatten();
+                    ctrl_bridge.card_action(&session_key, project.as_deref(), &action);
                 }
                 CtrlCmd::Message { sub_name, content } => {
+                    let project = project_by_name.get(&sub_name).cloned().flatten();
                     let uid = session_identity(&sub_name);
                     let session_key = BridgeService::session_key_for(&sub_name);
                     ctrl_log.push_for(
@@ -198,7 +201,9 @@ async fn run_service(
                     let log = ctrl_log.clone();
                     tokio::spawn(async move {
                         let started_at = Utc::now();
-                        let result = bridge.ask(&session_key, &uid, &sub_name, &content).await;
+                        let result = bridge
+                            .ask(&session_key, project.as_deref(), &uid, &sub_name, &content)
+                            .await;
                         let secs = Utc::now().signed_duration_since(started_at).num_seconds();
                         match result {
                             Ok(output) => log.push_for(
@@ -253,6 +258,8 @@ async fn run_subscription(sub: Subscription, bridge: BridgeClient, log: Log) {
     let uid = session_identity(&sub.name);
     // 同一订阅固定使用同一 session key，cc-connect 侧保留对话上下文
     let session_key = BridgeService::session_key_for(&sub.name);
+    // 订阅绑定的项目，盖在该会话所有出站消息上（None = 默认项目）
+    let project = project_of(&sub);
 
     while let Some(event) = rx.recv().await {
         // 展示 Webhook 原始数据（headers / query / body）
@@ -281,7 +288,7 @@ async fn run_subscription(sub: Subscription, bridge: BridgeClient, log: Log) {
         // 提交前先查询会话基础信息（工作目录 / 当前会话），
         // 回执由 cc-connect 以 📩 推送形式记入执行记录
         for cmd in ["cmd:/dir", "cmd:/current"] {
-            bridge.card_action(&session_key, cmd);
+            bridge.card_action(&session_key, project.as_deref(), cmd);
         }
 
         let prompt = build_prompt(&sub.base_prompt, &filtered.event);
@@ -295,7 +302,7 @@ async fn run_subscription(sub: Subscription, bridge: BridgeClient, log: Log) {
         );
 
         let (success, output, error) = match bridge
-            .ask(&session_key, &uid, &sub.name, &prompt)
+            .ask(&session_key, project.as_deref(), &uid, &sub.name, &prompt)
             .await
         {
             Ok(content) => (true, content, None),
@@ -340,16 +347,14 @@ async fn run_subscription(sub: Subscription, bridge: BridgeClient, log: Log) {
     }
 }
 
-/// 订阅会话的初始化命令：权限模式必发，provider / model 按配置追加
-fn session_init_actions(sub: &Subscription) -> Vec<String> {
-    let mut actions = vec![MODE_BYPASS_ACTION.to_string()];
-    if let Some(p) = sub.provider.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        actions.push(format!("cmd:/provider switch {p}"));
+/// 订阅绑定的项目名（空白 = 不指定，路由到 cc-connect 默认项目）
+fn project_of(sub: &Subscription) -> Option<String> {
+    let p = sub.project.trim();
+    if p.is_empty() {
+        None
+    } else {
+        Some(p.to_string())
     }
-    if let Some(m) = sub.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        actions.push(format!("cmd:/model switch {m}"));
-    }
-    actions
 }
 
 /// 解析 GUI 中的 Filter 字段：

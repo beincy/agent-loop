@@ -25,11 +25,17 @@ pub enum Outbound {
         user_name: String,
         content: String,
         reply_ctx: String,
+        /// 目标项目。cc-connect 实际按消息级 project 路由 engine
+        /// （register 的 project 字段被服务端忽略，见 core/bridge.go resolveEngine）
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
     },
     CardAction {
         session_key: String,
         action: String,
         reply_ctx: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
     },
     Ping {
         ts: u64,
@@ -110,10 +116,12 @@ mod tests {
             session_key: "agent-loop:a:a".into(),
             action: "perm:req-1:allow".into(),
             reply_ctx: "ctx-1".into(),
+            project: Some("my-project".into()),
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&action).unwrap()).unwrap();
         assert_eq!(v["type"], "card_action");
+        assert_eq!(v["project"], "my-project");
 
         let ping = Outbound::Ping { ts: 123 };
         let v: serde_json::Value =

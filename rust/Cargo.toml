@@ -21,6 +21,7 @@ chrono = "0.4"
 async-trait = "0.1"
 anyhow = "1"
 regex = "1"
+toml = "0.8"
 wasmtime = { version = "29", default-features = false, features = ["cranelift", "runtime", "std"] }
 tokio-tungstenite = "0.24"
 url = "2"

@@ -3,7 +3,7 @@ use eframe::egui;
 use crate::bridge_client::{ConnState, ConnStatus};
 use crate::bridge_service::BridgeService;
 use crate::event_log::{LogEntry, LogKind};
-use crate::gui_config::{AppConfig, Subscription};
+use crate::gui_config::{scan_cc_connect_projects, AppConfig, Subscription};
 
 pub struct AgentLoopApp {
     config: AppConfig,
@@ -12,6 +12,8 @@ pub struct AgentLoopApp {
     status_message: String,
     available_reporters: Vec<String>,
     available_filters: Vec<String>,
+    /// cc-connect 配置中的项目名列表（订阅表单下拉框选项）
+    available_projects: Vec<String>,
     selected_subscription: Option<usize>,
     show_new_subscription_dialog: bool,
     show_settings_window: bool,
@@ -40,6 +42,7 @@ impl Default for AgentLoopApp {
             status_message: "就绪".to_string(),
             available_reporters: Self::scan_reporters(),
             available_filters: Self::scan_filters(),
+            available_projects: scan_cc_connect_projects(),
             selected_subscription: None,
             show_new_subscription_dialog: false,
             show_settings_window: false,
@@ -330,21 +333,43 @@ impl AgentLoopApp {
         sub: &mut Subscription,
         available_reporters: &[String],
         available_filters: &[String],
+        available_projects: &[String],
         id_suffix: &str,
     ) {
         let full_line = |ui: &mut egui::Ui, text: &mut String| {
             ui.add(egui::TextEdit::singleline(text).desired_width(ui.available_width()));
         };
 
-        // 名称 | 工作区
+        // 名称 | 项目
         ui.columns(2, |cols| {
             cols[0].label("名称");
             full_line(&mut cols[0], &mut sub.name);
 
-            cols[1].label("工作区（可选）");
-            let mut workspace = sub.workspace.clone().unwrap_or_default();
-            full_line(&mut cols[1], &mut workspace);
-            sub.workspace = if workspace.is_empty() { None } else { Some(workspace) };
+            cols[1]
+                .label("项目")
+                .on_hover_text("绑定到 cc-connect 配置中的项目（register 时指定，会话按项目隔离）");
+            let display = if sub.project.is_empty() {
+                "(默认项目)".to_string()
+            } else {
+                sub.project.clone()
+            };
+            egui::ComboBox::from_id_salt(format!("project_{id_suffix}"))
+                .selected_text(display)
+                .width(cols[1].available_width())
+                .show_ui(&mut cols[1], |ui| {
+                    if ui.selectable_label(sub.project.is_empty(), "(默认项目)").clicked() {
+                        sub.project.clear();
+                    }
+                    for p in available_projects {
+                        if ui.selectable_label(sub.project == *p, p).clicked() {
+                            sub.project = p.clone();
+                        }
+                    }
+                    // 配置文件里已删除的项目仍保留为可见选项，避免误清空
+                    if !sub.project.is_empty() && !available_projects.contains(&sub.project) {
+                        let _ = ui.selectable_label(true, format!("{}（未在配置中）", sub.project));
+                    }
+                });
         });
 
         ui.add_space(6.0);
@@ -359,21 +384,6 @@ impl AgentLoopApp {
             [ui.available_width(), 80.0],
             egui::TextEdit::multiline(&mut sub.base_prompt),
         );
-
-        ui.add_space(6.0);
-
-        // Provider | Model
-        ui.columns(2, |cols| {
-            cols[0].label("Provider（可选）").on_hover_text("启动后执行 /provider switch <名称>");
-            let mut provider = sub.provider.clone().unwrap_or_default();
-            full_line(&mut cols[0], &mut provider);
-            sub.provider = if provider.trim().is_empty() { None } else { Some(provider) };
-
-            cols[1].label("Model（可选）").on_hover_text("启动后执行 /model switch <别名>");
-            let mut model = sub.model.clone().unwrap_or_default();
-            full_line(&mut cols[1], &mut model);
-            sub.model = if model.trim().is_empty() { None } else { Some(model) };
-        });
 
         ui.add_space(6.0);
 
@@ -578,6 +588,8 @@ impl eframe::App for AgentLoopApp {
                     if ui.add_sized([60.0, 28.0], egui::Button::new("+ 新建")).clicked() {
                         self.show_new_subscription_dialog = true;
                         self.new_subscription = Subscription::default();
+                        // 打开表单时重新读取 cc-connect 配置，项目列表保持最新
+                        self.available_projects = scan_cc_connect_projects();
                     }
                 });
 
@@ -606,6 +618,8 @@ impl eframe::App for AgentLoopApp {
                                 let response = ui.selectable_label(is_selected, &sub.name);
                                 if response.clicked() {
                                     self.selected_subscription = Some(idx);
+                                    // 打开详情时重新读取 cc-connect 配置，项目列表保持最新
+                                    self.available_projects = scan_cc_connect_projects();
                                 }
                             });
 
@@ -863,13 +877,6 @@ impl eframe::App for AgentLoopApp {
 
                     ui.add_space(8.0);
 
-                    ui.label("默认工作区");
-                    ui.text_edit_singleline(&mut self.config.default_workspace);
-
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-
                     ui.label("cc-connect 启动命令");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.config.cc_connect_command)
@@ -901,6 +908,7 @@ impl eframe::App for AgentLoopApp {
             } else {
                 let available_reporters = &self.available_reporters;
                 let available_filters = &self.available_filters;
+                let available_projects = &self.available_projects;
                 let service_running = self.is_running;
                 let sub = &mut self.config.subscriptions[idx];
                 egui::Window::new("订阅详情")
@@ -913,7 +921,7 @@ impl eframe::App for AgentLoopApp {
                     .show(ctx, |ui| {
                         ui.set_width(480.0);
 
-                        Self::subscription_form(ui, sub, available_reporters, available_filters, "detail");
+                        Self::subscription_form(ui, sub, available_reporters, available_filters, available_projects, "detail");
 
                         ui.add_space(8.0);
                         ui.separator();
@@ -926,7 +934,7 @@ impl eframe::App for AgentLoopApp {
                                 let btn = egui::Button::new("🧹 清除上下文");
                                 if ui
                                     .add_enabled(service_running, btn)
-                                    .on_hover_text("向 cc-connect 发送 card_action `cmd:/new`，\n开启新会话并重新下发初始化命令")
+                                    .on_hover_text("向 cc-connect 发送 card_action `cmd:/new` 开启新会话\n（权限模式等由项目配置决定，自动继承）")
                                     .on_disabled_hover_text("启动服务后可清除会话上下文")
                                     .clicked()
                                 {
@@ -1001,11 +1009,13 @@ impl eframe::App for AgentLoopApp {
 
                     let available_reporters = self.available_reporters.clone();
                     let available_filters = self.available_filters.clone();
+                    let available_projects = self.available_projects.clone();
                     Self::subscription_form(
                         ui,
                         &mut self.new_subscription,
                         &available_reporters,
                         &available_filters,
+                        &available_projects,
                         "new",
                     );
 
