@@ -1,9 +1,9 @@
-//! GUI 后台服务：smee 订阅 → 过滤 → 转发 cc-connect 执行 → 汇报结果
+//! GUI 后台服务：Webhook 订阅 → 过滤 → 转发 cc-connect 执行 → 汇报结果
 //!
 //! 项目隔离模型：本应用以单一 platform（`agent-loop`）维持一条 Bridge 连接，
-//! 每个订阅是其下的独立会话（session_key 互不相同，上下文隔离）；
+//! 每个 Agent 是其下的独立会话（session_key 互不相同，上下文隔离）；
 //! cc-connect 按消息级 `project` 字段路由项目 engine（register 的 project
-//! 字段被服务端忽略），因此每条 message / card_action 都盖上订阅绑定的项目。
+//! 字段被服务端忽略），因此每条 message / card_action 都盖上 Agent 绑定的项目。
 //!
 //! 在独立线程上运行 tokio runtime，GUI 通过 watch 通道下发停止信号、
 //! 通过 std::sync::mpsc 接收日志。
@@ -19,7 +19,7 @@ use crate::bridge_client::{BridgeClient, ConnStatus, SessionBinding, NEW_SESSION
 use crate::event_log::{Log, LogEntry, LogKind};
 use crate::executor::build_prompt;
 use crate::filter::apply_filters;
-use crate::gui_config::{AppConfig, Subscription};
+use crate::gui_config::{Agent, AppConfig};
 use crate::reporter::get_reporter;
 use crate::subscriber::run_sse_loop;
 use crate::types::{ExecutionResult, SmeeEventData};
@@ -33,8 +33,8 @@ enum CtrlCmd {
     ClearSession { session_key: String },
     /// 向指定会话发送任意 card_action（如 `cmd:/model switch k2`）
     CardAction { session_key: String, action: String },
-    /// 以用户身份向订阅会话推送一段话（走正常 message → reply 执行流程）
-    Message { sub_name: String, content: String },
+    /// 以用户身份向 Agent 会话推送一段话（走正常 message → reply 执行流程）
+    Message { agent_name: String, content: String },
 }
 
 pub struct BridgeService {
@@ -69,9 +69,9 @@ impl BridgeService {
         }
     }
 
-    /// 订阅对应的 Bridge session key（稳定值：同一订阅名总是同一会话，保留上下文）
-    pub fn session_key_for(sub_name: &str) -> String {
-        format!("{PLATFORM}:{0}:{0}", session_identity(sub_name))
+    /// Agent 对应的 Bridge session key（稳定值：同一 Agent 名总是同一会话，保留上下文）
+    pub fn session_key_for(agent_name: &str) -> String {
+        format!("{PLATFORM}:{0}:{0}", session_identity(agent_name))
     }
 
     /// 请求清除某个会话的上下文（cc-connect 侧执行 `/new` 开启新会话）
@@ -89,10 +89,10 @@ impl BridgeService {
         });
     }
 
-    /// 以用户身份向订阅会话推送一段话，执行结果记入执行记录
-    pub fn send_message(&self, sub_name: &str, content: &str) {
+    /// 以用户身份向 Agent 会话推送一段话，执行结果记入运行日志
+    pub fn send_message(&self, agent_name: &str, content: &str) {
         let _ = self.ctrl_tx.send(CtrlCmd::Message {
-            sub_name: sub_name.to_string(),
+            agent_name: agent_name.to_string(),
             content: content.to_string(),
         });
     }
@@ -122,13 +122,13 @@ async fn run_service(
         log.system("⚠️ 未配置 Bridge Token，cc-connect 可能拒绝连接（HTTP 401）");
     }
 
-    let enabled: Vec<Subscription> = config
-        .subscriptions
+    let enabled: Vec<Agent> = config
+        .agents
         .into_iter()
-        .filter(|s| s.enabled)
+        .filter(|a| a.enabled)
         .collect();
     if enabled.is_empty() {
-        log.system("⚠️ 没有启用的订阅，仅维持与 cc-connect 的连接");
+        log.system("⚠️ 没有启用的 Agent，仅维持与 cc-connect 的连接");
     }
 
     // 会话与项目的绑定：该会话所有出站消息按此路由。
@@ -140,7 +140,7 @@ async fn run_service(
             project: project_of(s),
         })
         .collect();
-    // GUI 控制指令按 session_key / 订阅名找回项目
+    // GUI 控制指令按 session_key / Agent 名找回项目
     let project_by_session: HashMap<String, Option<String>> = sessions
         .iter()
         .map(|s| (s.session_key.clone(), s.project.clone()))
@@ -159,8 +159,8 @@ async fn run_service(
         conn_status,
     );
 
-    for sub in enabled {
-        tokio::spawn(run_subscription(sub, bridge.clone(), log.clone()));
+    for agent in enabled {
+        tokio::spawn(run_agent(agent, bridge.clone(), log.clone()));
     }
 
     // GUI 控制指令（清除会话上下文等）
@@ -185,13 +185,13 @@ async fn run_service(
                     let project = project_by_session.get(&session_key).cloned().flatten();
                     ctrl_bridge.card_action(&session_key, project.as_deref(), &action);
                 }
-                CtrlCmd::Message { sub_name, content } => {
-                    let project = project_by_name.get(&sub_name).cloned().flatten();
-                    let uid = session_identity(&sub_name);
-                    let session_key = BridgeService::session_key_for(&sub_name);
+                CtrlCmd::Message { agent_name, content } => {
+                    let project = project_by_name.get(&agent_name).cloned().flatten();
+                    let uid = session_identity(&agent_name);
+                    let session_key = BridgeService::session_key_for(&agent_name);
                     ctrl_log.push_for(
                         LogKind::System,
-                        &sub_name,
+                        &agent_name,
                         &session_key,
                         "📤 已推送手动消息，等待执行结果...",
                         content.clone(),
@@ -202,20 +202,20 @@ async fn run_service(
                     tokio::spawn(async move {
                         let started_at = Utc::now();
                         let result = bridge
-                            .ask(&session_key, project.as_deref(), &uid, &sub_name, &content)
+                            .ask(&session_key, project.as_deref(), &uid, &agent_name, &content)
                             .await;
                         let secs = Utc::now().signed_duration_since(started_at).num_seconds();
                         match result {
                             Ok(output) => log.push_for(
                                 LogKind::Result,
-                                &sub_name,
+                                &agent_name,
                                 &session_key,
                                 format!("手动消息执行完成（{secs}s）"),
                                 output,
                             ),
                             Err(e) => log.push_for(
                                 LogKind::Error,
-                                &sub_name,
+                                &agent_name,
                                 &session_key,
                                 format!("手动消息执行失败（{secs}s）: {e}"),
                                 "",
@@ -236,37 +236,37 @@ async fn run_service(
     log.system("🛑 服务已停止");
 }
 
-/// 单个订阅的事件循环：SSE 接收 → 过滤 → 提交 cc-connect → 汇报结果（串行处理）
-async fn run_subscription(sub: Subscription, bridge: BridgeClient, log: Log) {
+/// 单个 Agent 的事件循环：Webhook(SSE) 接收 → 过滤 → 提交 cc-connect → 汇报结果（串行处理）
+async fn run_agent(agent: Agent, bridge: BridgeClient, log: Log) {
     let (tx, mut rx) = mpsc::unbounded_channel::<SmeeEventData>();
-    let smee_url = sub.smee_url.clone();
+    let webhook_url = agent.webhook_url.clone();
     let sse_log = log.clone();
-    tokio::spawn(async move { run_sse_loop(&smee_url, tx, sse_log).await });
+    tokio::spawn(async move { run_sse_loop(&webhook_url, tx, sse_log).await });
     log.push(
         LogKind::System,
-        &sub.name,
-        format!("📡 已订阅 {}", sub.smee_url),
+        &agent.name,
+        format!("📡 已监听 Webhook {}", agent.webhook_url),
         "",
     );
 
-    let reporter = get_reporter(sub.reporter.as_deref());
+    let reporter = get_reporter(agent.reporter.as_deref());
     if let Err(e) = reporter.initialize().await {
-        log.push(LogKind::Error, &sub.name, format!("汇报器初始化失败: {e}"), "");
+        log.push(LogKind::Error, &agent.name, format!("汇报器初始化失败: {e}"), "");
     }
 
-    let (filter_regex, wasm_policy) = parse_filter(sub.filter_regex.as_deref());
-    let uid = session_identity(&sub.name);
-    // 同一订阅固定使用同一 session key，cc-connect 侧保留对话上下文
-    let session_key = BridgeService::session_key_for(&sub.name);
-    // 订阅绑定的项目，盖在该会话所有出站消息上（None = 默认项目）
-    let project = project_of(&sub);
+    let (filter_regex, wasm_policy) = parse_filter(agent.filter_regex.as_deref());
+    let uid = session_identity(&agent.name);
+    // 同一 Agent 固定使用同一 session key，cc-connect 侧保留对话上下文
+    let session_key = BridgeService::session_key_for(&agent.name);
+    // Agent 绑定的项目，盖在该会话所有出站消息上（None = 默认项目）
+    let project = project_of(&agent);
 
     while let Some(event) = rx.recv().await {
         // 展示 Webhook 原始数据（headers / query / body）
         let event_json = serde_json::to_string_pretty(&event).unwrap_or_default();
         log.push_for(
             LogKind::Webhook,
-            &sub.name,
+            &agent.name,
             &session_key,
             "收到 Webhook 事件",
             event_json,
@@ -276,12 +276,12 @@ async fn run_subscription(sub: Subscription, bridge: BridgeClient, log: Log) {
             match apply_filters(event, filter_regex.as_deref(), wasm_policy.as_deref()).await {
                 Ok(fr) => fr,
                 Err(e) => {
-                    log.push(LogKind::Error, &sub.name, format!("过滤器错误: {e}"), "");
+                    log.push(LogKind::Error, &agent.name, format!("过滤器错误: {e}"), "");
                     continue;
                 }
             };
         if !filtered.allow {
-            log.push(LogKind::System, &sub.name, "🚫 事件已被过滤，跳过", "");
+            log.push(LogKind::System, &agent.name, "🚫 事件已被过滤，跳过", "");
             continue;
         }
 
@@ -291,18 +291,18 @@ async fn run_subscription(sub: Subscription, bridge: BridgeClient, log: Log) {
             bridge.card_action(&session_key, project.as_deref(), cmd);
         }
 
-        let prompt = build_prompt(&sub.base_prompt, &filtered.event);
+        let prompt = build_prompt(&agent.base_prompt, &filtered.event);
         let started_at = Utc::now();
         log.push_for(
             LogKind::System,
-            &sub.name,
+            &agent.name,
             &session_key,
             "🤖 已提交 cc-connect，等待执行结果...",
             prompt.clone(),
         );
 
         let (success, output, error) = match bridge
-            .ask(&session_key, project.as_deref(), &uid, &sub.name, &prompt)
+            .ask(&session_key, project.as_deref(), &uid, &agent.name, &prompt)
             .await
         {
             Ok(content) => (true, content, None),
@@ -314,7 +314,7 @@ async fn run_subscription(sub: Subscription, bridge: BridgeClient, log: Log) {
         if success {
             log.push_for(
                 LogKind::Result,
-                &sub.name,
+                &agent.name,
                 &session_key,
                 format!("执行完成（{secs}s）"),
                 output.clone(),
@@ -322,7 +322,7 @@ async fn run_subscription(sub: Subscription, bridge: BridgeClient, log: Log) {
         } else {
             log.push_for(
                 LogKind::Error,
-                &sub.name,
+                &agent.name,
                 &session_key,
                 format!(
                     "执行失败（{secs}s）: {}",
@@ -333,7 +333,7 @@ async fn run_subscription(sub: Subscription, bridge: BridgeClient, log: Log) {
         }
 
         let result = ExecutionResult {
-            subscription_name: sub.name.clone(),
+            subscription_name: agent.name.clone(),
             success,
             output,
             error,
@@ -342,14 +342,14 @@ async fn run_subscription(sub: Subscription, bridge: BridgeClient, log: Log) {
             prompt,
         };
         if let Err(e) = reporter.report(&result).await {
-            log.push(LogKind::Error, &sub.name, format!("汇报失败: {e}"), "");
+            log.push(LogKind::Error, &agent.name, format!("汇报失败: {e}"), "");
         }
     }
 }
 
-/// 订阅绑定的项目名（空白 = 不指定，路由到 cc-connect 默认项目）
-fn project_of(sub: &Subscription) -> Option<String> {
-    let p = sub.project.trim();
+/// Agent 绑定的项目名（空白 = 不指定，路由到 cc-connect 默认项目）
+fn project_of(agent: &Agent) -> Option<String> {
+    let p = agent.project.trim();
     if p.is_empty() {
         None
     } else {
@@ -376,8 +376,9 @@ fn parse_filter(raw: Option<&str>) -> (Option<String>, Option<String>) {
     }
 }
 
-/// 由订阅名生成 session_key 中的 scope/user 段。
+/// 由 Agent 名生成 session_key 中的 scope/user 段。
 /// 协议要求小写字母、数字、连字符；附加名称哈希避免中文名等清洗后冲突。
+/// 空 base 的兜底前缀保持 "sub-"，避免旧数据的会话上下文丢失。
 fn session_identity(name: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};

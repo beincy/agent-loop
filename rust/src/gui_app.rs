@@ -3,22 +3,23 @@ use eframe::egui;
 use crate::bridge_client::{ConnState, ConnStatus};
 use crate::bridge_service::BridgeService;
 use crate::event_log::{LogEntry, LogKind};
-use crate::gui_config::{scan_cc_connect_projects, AppConfig, Subscription};
+use crate::gui_config::{scan_cc_connect_projects, Agent, AppConfig};
 
 pub struct AgentLoopApp {
     config: AppConfig,
-    new_subscription: Subscription,
+    new_agent: Agent,
     is_running: bool,
     status_message: String,
     available_reporters: Vec<String>,
     available_filters: Vec<String>,
-    /// cc-connect 配置中的项目名列表（订阅表单下拉框选项）
+    /// cc-connect 配置中的项目名列表（Agent 表单下拉框选项）
     available_projects: Vec<String>,
-    selected_subscription: Option<usize>,
-    show_new_subscription_dialog: bool,
+    /// Some = 正在查看该 Agent 的详情页
+    selected_agent: Option<usize>,
+    show_new_agent_dialog: bool,
     show_settings_window: bool,
-    show_command_dialog: bool,
-    command_target: usize,
+    /// 运行日志窗口（系统/服务级日志，默认隐藏）
+    show_system_log_window: bool,
     command_input: String,
     /// 推送类型：false = 指令（card_action），true = 消息（message）
     command_send_message: bool,
@@ -37,19 +38,19 @@ impl Default for AgentLoopApp {
     fn default() -> Self {
         Self {
             config: AppConfig::load(),
-            new_subscription: Subscription::default(),
+            new_agent: Agent::default(),
             is_running: false,
             status_message: "就绪".to_string(),
             available_reporters: Self::scan_reporters(),
             available_filters: Self::scan_filters(),
             available_projects: scan_cc_connect_projects(),
-            selected_subscription: None,
-            show_new_subscription_dialog: false,
+            selected_agent: None,
+            show_new_agent_dialog: false,
             show_settings_window: false,
-            show_command_dialog: false,
-            command_target: 0,
+            show_system_log_window: false,
             command_input: String::new(),
-            command_send_message: false,
+            // chat 输入栏默认发「消息」，需要引擎指令时再切换
+            command_send_message: true,
             show_token: false,
             show_webhook_logs: true,
             show_result_logs: true,
@@ -326,11 +327,11 @@ impl AgentLoopApp {
         }
     }
 
-    /// 渲染订阅编辑表单（新建弹窗与详情弹窗共用）。
-    /// 短字段两列一排，压缩弹窗高度。
-    fn subscription_form(
+    /// 渲染 Agent 编辑表单（新建弹窗与详情页共用）。
+    /// 短字段两列一排，压缩高度。
+    fn agent_form(
         ui: &mut egui::Ui,
-        sub: &mut Subscription,
+        sub: &mut Agent,
         available_reporters: &[String],
         available_filters: &[String],
         available_projects: &[String],
@@ -374,8 +375,21 @@ impl AgentLoopApp {
 
         ui.add_space(6.0);
 
-        ui.label("Smee URL");
-        full_line(ui, &mut sub.smee_url);
+        ui.label("触发方式");
+        ui.horizontal(|ui| {
+            // 目前仅支持 Webhook 一种触发方式，下拉框占位便于后续扩展
+            egui::ComboBox::from_id_salt(format!("trigger_{id_suffix}"))
+                .selected_text("Webhook")
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    let _ = ui.selectable_label(true, "Webhook");
+                });
+            ui.add(
+                egui::TextEdit::singleline(&mut sub.webhook_url)
+                    .desired_width(ui.available_width())
+                    .hint_text("Webhook URL（如 https://smee.io/xxxx）"),
+            );
+        });
 
         ui.add_space(6.0);
 
@@ -465,6 +479,535 @@ impl AgentLoopApp {
 
         sub.filter_regex = if selected_filter == "none" { None } else { Some(selected_filter) };
     }
+
+    /// 日志条目是否属于某个 Agent（按来源名或 Bridge 会话键匹配）
+    fn belongs_to_agent(entry: &LogEntry, name: &str, session_key: &str) -> bool {
+        entry.source == name
+            || (!entry.session_key.is_empty() && entry.session_key == session_key)
+    }
+
+    /// 是否为会话分界点（清除上下文后开启新会话）
+    fn is_session_boundary(entry: &LogEntry) -> bool {
+        entry.summary.starts_with("🧹")
+    }
+
+    /// 渲染单条日志（详情页会话分组与主页系统日志共用）
+    fn render_log_entry(ui: &mut egui::Ui, salt: (usize, usize), entry: &LogEntry) {
+        let (icon, color) = match entry.kind {
+            LogKind::Webhook => ("📨", egui::Color32::from_rgb(100, 181, 246)),
+            LogKind::Result => ("✅", egui::Color32::from_rgb(46, 204, 113)),
+            LogKind::Error => ("❌", egui::Color32::from_rgb(231, 76, 60)),
+            LogKind::System => ("•", egui::Color32::GRAY),
+        };
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(entry.time.format("%H:%M:%S").to_string())
+                    .monospace()
+                    .weak(),
+            );
+            ui.colored_label(color, format!("{icon} [{}]", entry.source));
+            ui.label(&entry.summary);
+        });
+
+        if !entry.detail.is_empty() {
+            ui.indent(("log_indent", salt), |ui| {
+                egui::CollapsingHeader::new("详情")
+                    .id_salt((salt, entry.time.timestamp_millis()))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(&entry.detail)
+                                .monospace()
+                                .size(12.0),
+                        );
+                    });
+            });
+        }
+        ui.add_space(2.0);
+    }
+
+    /// 主页：Agent 卡片网格（每行按窗口宽度自适应列数，超出纵向滚动）
+    fn ui_cards_page(&mut self, ui: &mut egui::Ui) {
+        let mut open_new = false;
+        let mut clicked: Option<usize> = None;
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.heading("Agents");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_sized([110.0, 28.0], egui::Button::new("＋ 新建 Agent")).clicked() {
+                    open_new = true;
+                }
+            });
+        });
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if self.config.agents.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(60.0);
+                        ui.label("暂无 Agent");
+                        ui.add_space(8.0);
+                        ui.weak("点击右上角「＋ 新建 Agent」创建第一个 Agent");
+                    });
+                    return;
+                }
+
+                const SPACING: f32 = 12.0;
+                ui.spacing_mut().item_spacing = egui::vec2(SPACING, SPACING);
+                // 列数按最小卡宽计算，再把剩余宽度均分给各卡片，行尾不留空隙
+                let avail = ui.available_width();
+                let cols = (((avail + SPACING) / (Self::CARD_W + SPACING)).floor() as usize).max(1);
+                let card_w = (avail - SPACING * (cols as f32 - 1.0)) / cols as f32;
+
+                let total = self.config.agents.len();
+                for row_start in (0..total).step_by(cols) {
+                    ui.horizontal(|ui| {
+                        for idx in row_start..(row_start + cols).min(total) {
+                            let agent = &self.config.agents[idx];
+                            if Self::agent_card(ui, agent, &self.logs, card_w).clicked() {
+                                clicked = Some(idx);
+                            }
+                        }
+                    });
+                }
+            });
+
+        if open_new {
+            self.show_new_agent_dialog = true;
+            self.new_agent = Agent::default();
+            // 打开表单时重新读取 cc-connect 配置，项目列表保持最新
+            self.available_projects = scan_cc_connect_projects();
+        }
+        if let Some(idx) = clicked {
+            self.selected_agent = Some(idx);
+            self.command_input.clear();
+            self.available_projects = scan_cc_connect_projects();
+        }
+    }
+
+    /// 卡片最小宽度（网格列数按窗口宽度自适应，实际宽度均分填满整行）
+    const CARD_W: f32 = 260.0;
+
+    /// 渲染单张 Agent 卡片，返回整卡的点击响应
+    fn agent_card(
+        ui: &mut egui::Ui,
+        agent: &Agent,
+        logs: &[LogEntry],
+        card_w: f32,
+    ) -> egui::Response {
+        const CARD_H: f32 = 110.0;
+        // 内容区宽度 = 卡片宽度扣除左右内边距
+        let inner_w: f32 = card_w - 2.0 * 14.0;
+
+        let session_key = BridgeService::session_key_for(&agent.name);
+        let last_entry = logs
+            .iter()
+            .rev()
+            .find(|e| Self::belongs_to_agent(e, &agent.name, &session_key));
+
+        let frame = egui::Frame::none()
+            .fill(ui.visuals().faint_bg_color)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .rounding(egui::Rounding::same(10.0))
+            .inner_margin(egui::Margin::same(14.0))
+            .show(ui, |ui| {
+                // 卡片在网格的横向布局中渲染，内部强制竖排并锁定宽度
+                ui.vertical(|ui| {
+                    ui.set_width(inner_w);
+                    ui.set_max_width(inner_w);
+                    ui.set_min_height(CARD_H);
+                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+
+                    ui.horizontal(|ui| {
+                        if agent.enabled {
+                            ui.colored_label(egui::Color32::from_rgb(46, 204, 113), "●");
+                        } else {
+                            ui.colored_label(egui::Color32::GRAY, "○");
+                        }
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&agent.name).strong().size(15.0))
+                                .truncate(),
+                        );
+                    });
+                    ui.add_space(4.0);
+
+                    let project = if agent.project.is_empty() {
+                        "(默认项目)".to_string()
+                    } else {
+                        agent.project.clone()
+                    };
+                    ui.weak(format!("项目: {project}"));
+                    ui.weak("触发: Webhook");
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&agent.webhook_url)
+                                .weak()
+                                .monospace()
+                                .size(11.0),
+                        )
+                        .truncate(),
+                    );
+
+                    ui.add_space(4.0);
+                    match last_entry {
+                        Some(e) => {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "最近 {} · {}",
+                                        e.time.format("%H:%M:%S"),
+                                        e.summary
+                                    ))
+                                    .weak()
+                                    .size(11.0),
+                                )
+                                .truncate(),
+                            );
+                        }
+                        None => {
+                            ui.weak(egui::RichText::new("暂无活动").size(11.0));
+                        }
+                    }
+                });
+            });
+
+        let resp = frame
+            .response
+            .interact(egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if resp.hovered() {
+            ui.painter().rect_stroke(
+                resp.rect,
+                10.0,
+                egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
+            );
+        }
+        resp
+    }
+
+    /// Agent 详情页：配置编辑 + 会话操作 + 发送指令 + 按会话分组的运行日志
+    fn ui_detail_page(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let is_running = self.is_running;
+        let session_key = BridgeService::session_key_for(&self.config.agents[idx].name);
+
+        let mut back = false;
+        let mut delete = false;
+        let mut save = false;
+        let mut clear_session = false;
+        let mut send = false;
+        let mut clear_logs = false;
+
+        {
+            // 拆分借用：表单要改 agent，日志区只读 self.logs
+            let Self {
+                config,
+                logs,
+                available_reporters,
+                available_filters,
+                available_projects,
+                command_input,
+                command_send_message,
+                show_webhook_logs,
+                show_result_logs,
+                show_system_logs,
+                ..
+            } = self;
+            let agent = &mut config.agents[idx];
+
+            // 底部固定的聊天输入栏（chat 风格：日志在上滚动，输入在下）
+            // 左右留 2px，避免圆角边框恰好压在裁剪边界上被切掉
+            egui::TopBottomPanel::bottom("agent_chat_panel")
+                .frame(egui::Frame::none().inner_margin(egui::Margin {
+                    left: 2.0,
+                    right: 2.0,
+                    top: 8.0,
+                    bottom: 10.0,
+                }))
+                .show_separator_line(false)
+                .show_inside(ui, |ui| {
+                    let edit_id = egui::Id::new("agent_chat_edit");
+                    // Enter 发送、Shift+Enter 换行；仅在输入框聚焦时消费按键
+                    let enter_send = ui.ctx().memory(|m| m.has_focus(edit_id))
+                        && ui.input_mut(|i| {
+                            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                        });
+                    let can_send = is_running && !command_input.trim().is_empty();
+
+                    egui::Frame::none()
+                        .fill(ui.visuals().extreme_bg_color)
+                        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                        .rounding(egui::Rounding::same(10.0))
+                        .inner_margin(egui::Margin::same(8.0))
+                        .show(ui, |ui| {
+                            let hint = if *command_send_message {
+                                "给该 Agent 发一段话…（Enter 发送，Shift+Enter 换行）"
+                            } else {
+                                "输入指令，如 /model switch k2、/dir /tmp、/current（Enter 发送）"
+                            };
+                            ui.add(
+                                egui::TextEdit::multiline(command_input)
+                                    .id(edit_id)
+                                    .frame(false)
+                                    .desired_rows(2)
+                                    .desired_width(ui.available_width())
+                                    .hint_text(hint),
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(command_send_message, true, "💬 消息")
+                                    .on_hover_text("以用户身份推送一段话，走正常 message 执行流程");
+                                ui.selectable_value(command_send_message, false, "⌨ 指令")
+                                    .on_hover_text("发送 card_action 引擎命令，回执以 📩 记入运行日志");
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add_enabled(can_send, egui::Button::new("⬆ 发送"))
+                                            .on_disabled_hover_text(if is_running {
+                                                "请输入内容"
+                                            } else {
+                                                "启动服务后才能发送"
+                                            })
+                                            .clicked()
+                                        {
+                                            send = true;
+                                        }
+                                        if !is_running {
+                                            ui.weak("启动服务后可发送");
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    if enter_send && can_send {
+                        send = true;
+                    }
+                });
+
+            // 中央区域：页头 + 配置 + 会话 + 运行日志（占底部输入栏之外的剩余空间）
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show_inside(ui, |ui| {
+                // 页头：返回 + 状态点 + 名称 + 删除
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add_sized([70.0, 28.0], egui::Button::new("← 返回")).clicked() {
+                        back = true;
+                    }
+                    ui.add_space(8.0);
+                    if agent.enabled {
+                        ui.colored_label(egui::Color32::from_rgb(46, 204, 113), "●");
+                    } else {
+                        ui.colored_label(egui::Color32::GRAY, "○");
+                    }
+                    ui.heading(&agent.name);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_sized([70.0, 28.0], egui::Button::new("🗑 删除")).clicked() {
+                            delete = true;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // 配置（默认收起，日志才是详情页主角）
+                egui::CollapsingHeader::new("⚙ 配置")
+                    .id_salt(("agent_config", idx))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        Self::agent_form(
+                            ui,
+                            agent,
+                            available_reporters,
+                            available_filters,
+                            available_projects,
+                            "detail",
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut agent.enabled, "启用此 Agent")
+                                .on_hover_text("修改启用状态与配置后需保存，重启服务生效");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add_sized([90.0, 26.0], egui::Button::new("💾 保存")).clicked() {
+                                    save = true;
+                                }
+                            });
+                        });
+                    });
+
+                ui.add_space(4.0);
+
+                // 会话信息与操作（同一 Agent 固定 session key，cc-connect 侧保留上下文）
+                ui.horizontal(|ui| {
+                    ui.weak("会话:");
+                    ui.label(
+                        egui::RichText::new(&session_key)
+                            .monospace()
+                            .weak()
+                            .size(11.0),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(is_running, egui::Button::new("🧹 清除上下文"))
+                            .on_hover_text("向 cc-connect 发送 card_action `cmd:/new` 开启新会话\n（权限模式等由项目配置决定，自动继承）")
+                            .on_disabled_hover_text("启动服务后可清除会话上下文")
+                            .clicked()
+                        {
+                            clear_session = true;
+                        }
+                    });
+                });
+
+                ui.add_space(4.0);
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                // 运行日志（按会话分组）
+                ui.horizontal(|ui| {
+                    ui.strong("运行日志");
+                    ui.add_space(12.0);
+                    ui.checkbox(show_webhook_logs, "📨 Webhook");
+                    ui.checkbox(show_result_logs, "✅ 执行结果");
+                    ui.checkbox(show_system_logs, "⚙ 系统");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("清空日志").clicked() {
+                            clear_logs = true;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+
+                let visible: Vec<(usize, &LogEntry)> = logs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| Self::belongs_to_agent(e, &agent.name, &session_key))
+                    .filter(|(_, e)| match e.kind {
+                        LogKind::Webhook => *show_webhook_logs,
+                        LogKind::Result => *show_result_logs,
+                        LogKind::System => *show_system_logs,
+                        LogKind::Error => true, // 错误始终展示
+                    })
+                    .collect();
+
+                // 以「🧹 清除上下文」为分界拆分会话，历史会话折叠、当前会话展开
+                let mut groups: Vec<Vec<(usize, &LogEntry)>> = Vec::new();
+                for (i, e) in visible {
+                    let boundary = Self::is_session_boundary(e);
+                    if groups.is_empty() || (boundary && !groups.last().unwrap().is_empty()) {
+                        groups.push(Vec::new());
+                    }
+                    groups.last_mut().unwrap().push((i, e));
+                }
+
+                // 每组最多渲染最近 50 条，避免长时间运行后渲染压力过大
+                const MAX_GROUP_LOGS: usize = 50;
+                let render_group =
+                    |ui: &mut egui::Ui, gi: usize, group: &[(usize, &LogEntry)]| {
+                        let skipped = group.len().saturating_sub(MAX_GROUP_LOGS);
+                        if skipped > 0 {
+                            ui.weak(format!("… 已省略较早的 {skipped} 条"));
+                            ui.add_space(2.0);
+                        }
+                        for &(i, entry) in group.iter().skip(skipped) {
+                            Self::render_log_entry(ui, (gi, i), entry);
+                        }
+                    };
+
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        if groups.is_empty() {
+                            ui.add_space(40.0);
+                            ui.vertical_centered(|ui| {
+                                if logs.is_empty() {
+                                    ui.weak("暂无记录。点击「▶ 启动服务」开始监听 Webhook 事件。");
+                                } else {
+                                    ui.weak("该 Agent 在当前筛选条件下没有记录");
+                                }
+                            });
+                            return;
+                        }
+
+                        let last_gi = groups.len() - 1;
+                        for (gi, group) in groups.iter().enumerate() {
+                            let start = group
+                                .first()
+                                .map(|(_, e)| e.time.format("%H:%M:%S").to_string())
+                                .unwrap_or_default();
+                            if gi == last_gi {
+                                ui.weak(format!(
+                                    "── 当前会话 · 自 {start} · {} 条 ──",
+                                    group.len()
+                                ));
+                                ui.add_space(4.0);
+                                render_group(ui, gi, group);
+                            } else {
+                                let end = group
+                                    .last()
+                                    .map(|(_, e)| e.time.format("%H:%M:%S").to_string())
+                                    .unwrap_or_default();
+                                egui::CollapsingHeader::new(format!(
+                                    "会话 {} · {start} – {end} · {} 条",
+                                    gi + 1,
+                                    group.len()
+                                ))
+                                .id_salt(("session_group", gi))
+                                .default_open(false)
+                                .show(ui, |ui| render_group(ui, gi, group));
+                                ui.add_space(4.0);
+                            }
+                        }
+                    });
+                });
+        }
+
+        // UI 闭包结束后统一处理动作，避免借用冲突
+        if back {
+            self.selected_agent = None;
+        }
+        if save {
+            self.save_config();
+        }
+        if clear_session {
+            if let Some(svc) = &self.service {
+                svc.clear_session(&session_key);
+                self.status_message = format!("已发送清除上下文指令: {session_key}");
+            }
+        }
+        if send {
+            if let Some(svc) = &self.service {
+                let name = self.config.agents[idx].name.clone();
+                if self.command_send_message {
+                    svc.send_message(&name, self.command_input.trim());
+                    self.status_message = format!("消息已推送 → {name}");
+                } else {
+                    let action = Self::command_action(&self.command_input);
+                    svc.send_command(&session_key, &action);
+                    self.status_message = format!("指令已发送: {action} → {name}");
+                }
+                self.command_input.clear();
+            }
+        }
+        if clear_logs {
+            let name = self.config.agents[idx].name.clone();
+            self.logs
+                .retain(|e| !Self::belongs_to_agent(e, &name, &session_key));
+        }
+        if delete {
+            self.config.agents.remove(idx);
+            self.selected_agent = None;
+            self.save_config();
+        }
+    }
 }
 
 impl Drop for AgentLoopApp {
@@ -494,9 +1037,17 @@ impl eframe::App for AgentLoopApp {
                 ui.heading("Agent Loop");
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // 最右：设置按钮
+                    // 最右：设置 + 运行日志按钮
                     if ui.add_sized([70.0, 26.0], egui::Button::new("⚙ 设置")).clicked() {
                         self.show_settings_window = true;
+                    }
+                    ui.add_space(4.0);
+                    if ui
+                        .add_sized([90.0, 26.0], egui::Button::new("📋 运行日志"))
+                        .on_hover_text("查看服务/连接等系统级日志（各 Agent 的对话日志在其卡片详情页中）")
+                        .clicked()
+                    {
+                        self.show_system_log_window = !self.show_system_log_window;
                     }
 
                     ui.add_space(12.0);
@@ -574,278 +1125,22 @@ impl eframe::App for AgentLoopApp {
             ui.add_space(8.0);
         });
 
-        // 左侧订阅列表
-        egui::SidePanel::left("subscription_list")
-            .resizable(true)
-            .default_width(240.0)
-            .width_range(180.0..=400.0)
-            .show(ctx, |ui| {
-                ui.add_space(8.0);
-
-                ui.horizontal(|ui| {
-                    ui.heading("订阅列表");
-                    ui.add_space((ui.available_width() - 65.0).max(0.0));
-                    if ui.add_sized([60.0, 28.0], egui::Button::new("+ 新建")).clicked() {
-                        self.show_new_subscription_dialog = true;
-                        self.new_subscription = Subscription::default();
-                        // 打开表单时重新读取 cc-connect 配置，项目列表保持最新
-                        self.available_projects = scan_cc_connect_projects();
-                    }
-                });
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                if self.config.subscriptions.is_empty() {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
-                        ui.label("暂无订阅");
-                        ui.add_space(8.0);
-                        ui.label("点击右上角 + 新建 按钮添加");
-                    });
-                } else {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (idx, sub) in self.config.subscriptions.iter().enumerate() {
-                            let is_selected = self.selected_subscription == Some(idx);
-
-                            ui.horizontal(|ui| {
-                                if sub.enabled {
-                                    ui.colored_label(egui::Color32::from_rgb(46, 204, 113), "●");
-                                } else {
-                                    ui.colored_label(egui::Color32::GRAY, "○");
-                                }
-                                let response = ui.selectable_label(is_selected, &sub.name);
-                                if response.clicked() {
-                                    self.selected_subscription = Some(idx);
-                                    // 打开详情时重新读取 cc-connect 配置，项目列表保持最新
-                                    self.available_projects = scan_cc_connect_projects();
-                                }
-                            });
-
-                            ui.add_space(4.0);
-                        }
-                    });
-                    ui.add_space(8.0);
-                    ui.weak("点击订阅可编辑详情");
-                }
-            });
-
-        // 主区域：执行记录（Webhook 数据 + 执行结果 + 系统日志）
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.heading("执行记录");
-                ui.add_space(16.0);
-                ui.checkbox(&mut self.show_webhook_logs, "📨 Webhook");
-                ui.checkbox(&mut self.show_result_logs, "✅ 执行结果");
-                ui.checkbox(&mut self.show_system_logs, "⚙ 系统");
-                ui.add_space((ui.available_width() - 135.0).max(0.0));
-                if ui
-                    .add_sized([60.0, 24.0], egui::Button::new("📤 指令"))
-                    .on_hover_text("向某个订阅的会话发送指令（card_action）")
-                    .clicked()
-                {
-                    self.show_command_dialog = true;
-                }
-                ui.add_space(4.0);
-                if ui.add_sized([60.0, 24.0], egui::Button::new("清空")).clicked() {
-                    self.logs.clear();
-                }
-            });
-            ui.add_space(4.0);
-            ui.separator();
-
-            // 只渲染最近 20 条可见记录，避免长时间运行后日志过多造成渲染压力
-            // （内存中仍保留最近 1000 条，切换筛选类型时各自取最近 20 条）
-            const MAX_VISIBLE_LOGS: usize = 20;
-
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.add_space(4.0);
-                    let visible_entries: Vec<(usize, &LogEntry)> = self
-                        .logs
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, entry)| match entry.kind {
-                            LogKind::Webhook => self.show_webhook_logs,
-                            LogKind::Result => self.show_result_logs,
-                            LogKind::System => self.show_system_logs,
-                            LogKind::Error => true, // 错误始终展示
-                        })
-                        .collect();
-                    let shown = visible_entries.len().min(MAX_VISIBLE_LOGS);
-                    let skipped = visible_entries.len() - shown;
-                    if skipped > 0 {
-                        ui.weak(format!("… 已省略较早的 {skipped} 条，仅展示最近 {MAX_VISIBLE_LOGS} 条"));
-                        ui.add_space(2.0);
-                    }
-                    for &(idx, entry) in visible_entries.iter().skip(skipped) {
-                        let (icon, color) = match entry.kind {
-                            LogKind::Webhook => ("📨", egui::Color32::from_rgb(100, 181, 246)),
-                            LogKind::Result => ("✅", egui::Color32::from_rgb(46, 204, 113)),
-                            LogKind::Error => ("❌", egui::Color32::from_rgb(231, 76, 60)),
-                            LogKind::System => ("•", egui::Color32::GRAY),
-                        };
-
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                egui::RichText::new(entry.time.format("%H:%M:%S").to_string())
-                                    .monospace()
-                                    .weak(),
-                            );
-                            ui.colored_label(color, format!("{icon} [{}]", entry.source));
-                            if !entry.session_key.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(format!("🔑 {}", entry.session_key))
-                                        .monospace()
-                                        .weak()
-                                        .size(11.0),
-                                )
-                                .on_hover_text("Bridge 会话 Session Key（同一订阅共用，保留上下文）");
-                            }
-                            ui.label(&entry.summary);
-                        });
-
-                        if !entry.detail.is_empty() {
-                            ui.indent(("log_indent", idx), |ui| {
-                                egui::CollapsingHeader::new("详情")
-                                    .id_salt((idx, entry.time.timestamp_millis()))
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            egui::RichText::new(&entry.detail)
-                                                .monospace()
-                                                .size(12.0),
-                                        );
-                                    });
-                            });
-                        }
-                        ui.add_space(2.0);
-                    }
-
-                    if shown == 0 {
-                        ui.add_space(40.0);
-                        ui.vertical_centered(|ui| {
-                            if self.logs.is_empty() {
-                                ui.weak("暂无记录。点击「▶ 启动服务」开始监听 Webhook 事件。");
-                            } else {
-                                ui.weak("当前筛选条件下没有记录");
-                            }
-                        });
-                    }
-                });
-        });
-
-        // 指令弹窗：选择订阅会话，发送任意 card_action 指令
-        if self.show_command_dialog {
-            let mut open = true;
-            let mut send_clicked = false;
-            egui::Window::new("📤 发送指令")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.set_width(420.0);
-
-                    ui.label("目标订阅");
-                    if self.config.subscriptions.is_empty() {
-                        ui.weak("暂无订阅，请先创建");
-                    } else {
-                        if self.command_target >= self.config.subscriptions.len() {
-                            self.command_target = 0;
-                        }
-                        let current_name =
-                            self.config.subscriptions[self.command_target].name.clone();
-                        egui::ComboBox::from_id_salt("command_target")
-                            .selected_text(&current_name)
-                            .width(ui.available_width())
-                            .show_ui(ui, |ui| {
-                                for (i, s) in self.config.subscriptions.iter().enumerate() {
-                                    ui.selectable_value(&mut self.command_target, i, &s.name);
-                                }
-                            });
-                        ui.label(
-                            egui::RichText::new(BridgeService::session_key_for(
-                                &self.config.subscriptions[self.command_target].name,
-                            ))
-                            .monospace()
-                            .weak()
-                            .size(11.0),
-                        );
-                    }
-
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label("类型");
-                        ui.selectable_value(&mut self.command_send_message, false, "指令")
-                            .on_hover_text("发送 card_action 引擎命令，回执以 📩 记入执行记录");
-                        ui.selectable_value(&mut self.command_send_message, true, "消息")
-                            .on_hover_text("以用户身份推送一段话，走正常 message 执行流程");
-                    });
-
-                    ui.add_space(8.0);
-                    let enter_pressed = if self.command_send_message {
-                        ui.label("消息内容");
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.command_input)
-                                .desired_width(ui.available_width())
-                                .desired_rows(4)
-                                .hint_text("要推送给 agent 的一段话"),
-                        );
-                        false // 多行输入回车用于换行，不触发发送
-                    } else {
-                        ui.label("指令");
-                        let input = ui.add(
-                            egui::TextEdit::singleline(&mut self.command_input)
-                                .desired_width(ui.available_width())
-                                .hint_text("如 /model switch k2、/dir /tmp、/current"),
-                        );
-                        input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    };
-
-                    ui.add_space(12.0);
-                    let can_send = self.is_running
-                        && !self.config.subscriptions.is_empty()
-                        && !self.command_input.trim().is_empty();
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(can_send, egui::Button::new("📤 发送"))
-                            .on_disabled_hover_text(if self.is_running {
-                                "请选择订阅并输入指令"
-                            } else {
-                                "启动服务后才能发送指令"
-                            })
-                            .clicked()
-                            || (can_send && enter_pressed)
-                        {
-                            send_clicked = true;
-                        }
-                    });
-                });
-
-            if send_clicked {
-                if let Some(svc) = &self.service {
-                    let name = self.config.subscriptions[self.command_target].name.clone();
-                    if self.command_send_message {
-                        svc.send_message(&name, self.command_input.trim());
-                        self.status_message = format!("消息已推送 → {name}");
-                    } else {
-                        let key = BridgeService::session_key_for(&name);
-                        let action = Self::command_action(&self.command_input);
-                        svc.send_command(&key, &action);
-                        self.status_message = format!("指令已发送: {action} → {name}");
-                    }
-                    self.command_input.clear();
-                    self.show_command_dialog = false;
-                }
-            }
-            if !open {
-                self.show_command_dialog = false;
+        // 主区域：Agent 卡片主页 / 点击卡片进入的详情页
+        if let Some(idx) = self.selected_agent {
+            if idx >= self.config.agents.len() {
+                self.selected_agent = None;
             }
         }
+        // 主区域左右多留一点边距，避免右对齐按钮与内容边框贴死窗口边缘
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(14.0, 8.0)),
+            )
+            .show(ctx, |ui| match self.selected_agent {
+                Some(idx) => self.ui_detail_page(ui, idx),
+                None => self.ui_cards_page(ui),
+            });
 
         // 设置弹窗（连接配置不常变更，收进这里）
         if self.show_settings_window {
@@ -897,153 +1192,129 @@ impl eframe::App for AgentLoopApp {
             }
         }
 
-        // 订阅详情弹窗
-        let mut delete_selected = false;
-        let mut close_detail = false;
-        let mut save_detail = false;
-        let mut clear_session_clicked = false;
-        if let Some(idx) = self.selected_subscription {
-            if idx >= self.config.subscriptions.len() {
-                self.selected_subscription = None;
-            } else {
-                let available_reporters = &self.available_reporters;
-                let available_filters = &self.available_filters;
-                let available_projects = &self.available_projects;
-                let service_running = self.is_running;
-                let sub = &mut self.config.subscriptions[idx];
-                egui::Window::new("订阅详情")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    // 内容超过窗口高度时出现滚动条，弹窗不超出屏幕
-                    .max_height(ctx.screen_rect().height() - 120.0)
-                    .vscroll(true)
-                    .show(ctx, |ui| {
-                        ui.set_width(480.0);
+        // 运行日志窗口：不属于任何 Agent 的系统级日志（服务启停、cc-connect 连接等）。
+        // 默认隐藏，顶部栏「📋 运行日志」开关。
+        if self.show_system_log_window {
+            let mut open = true;
+            let mut clear_clicked = false;
+            let names_keys: Vec<(String, String)> = self
+                .config
+                .agents
+                .iter()
+                .map(|a| (a.name.clone(), BridgeService::session_key_for(&a.name)))
+                .collect();
+            egui::Window::new("📋 运行日志")
+                .open(&mut open)
+                .default_size([560.0, 360.0])
+                .resizable(true)
+                .show(ctx, |ui| {
+                    let sys_entries: Vec<(usize, &LogEntry)> = self
+                        .logs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| {
+                            !names_keys
+                                .iter()
+                                .any(|(n, k)| Self::belongs_to_agent(e, n, k))
+                        })
+                        .collect();
 
-                        Self::subscription_form(ui, sub, available_reporters, available_filters, available_projects, "detail");
-
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(6.0);
-
-                        // 启用开关 + 会话上下文操作放同一排
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut sub.enabled, "启用此订阅");
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let btn = egui::Button::new("🧹 清除上下文");
-                                if ui
-                                    .add_enabled(service_running, btn)
-                                    .on_hover_text("向 cc-connect 发送 card_action `cmd:/new` 开启新会话\n（权限模式等由项目配置决定，自动继承）")
-                                    .on_disabled_hover_text("启动服务后可清除会话上下文")
-                                    .clicked()
-                                {
-                                    clear_session_clicked = true;
-                                }
-                            });
-                        });
-                        // 同一订阅固定 session key，cc-connect 侧保留上下文
-                        ui.horizontal(|ui| {
-                            ui.weak("会话:");
-                            ui.label(
-                                egui::RichText::new(BridgeService::session_key_for(&sub.name))
-                                    .monospace()
-                                    .weak()
-                                    .size(11.0),
-                            );
-                        });
-
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(6.0);
-
-                        ui.horizontal(|ui| {
-                            if ui.add_sized([60.0, 28.0], egui::Button::new("🗑 删除")).clicked() {
-                                delete_selected = true;
-                            }
-                            ui.add_space(8.0);
-                            if ui.add_sized([60.0, 28.0], egui::Button::new("关闭")).clicked() {
-                                close_detail = true;
-                            }
-                            ui.add_space(8.0);
-                            if ui.add_sized([100.0, 28.0], egui::Button::new("💾 保存并关闭")).clicked() {
-                                save_detail = true;
-                                close_detail = true;
+                    ui.horizontal(|ui| {
+                        ui.weak(format!(
+                            "服务与连接状态日志，共 {} 条。各 Agent 的对话日志在其详情页查看。",
+                            sys_entries.len()
+                        ));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("清空").clicked() {
+                                clear_clicked = true;
                             }
                         });
                     });
+                    ui.separator();
+
+                    const MAX_SYS_LOGS: usize = 50;
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if sys_entries.is_empty() {
+                                ui.add_space(20.0);
+                                ui.vertical_centered(|ui| {
+                                    ui.weak("暂无系统日志。点击「▶ 启动服务」开始监听。");
+                                });
+                                return;
+                            }
+                            let skipped = sys_entries.len().saturating_sub(MAX_SYS_LOGS);
+                            if skipped > 0 {
+                                ui.weak(format!("… 已省略较早的 {skipped} 条"));
+                            }
+                            for &(i, entry) in sys_entries.iter().skip(skipped) {
+                                Self::render_log_entry(ui, (usize::MAX, i), entry);
+                            }
+                        });
+                });
+            if clear_clicked {
+                self.logs
+                    .retain(|e| names_keys.iter().any(|(n, k)| Self::belongs_to_agent(e, n, k)));
+            }
+            if !open {
+                self.show_system_log_window = false;
             }
         }
 
-        if clear_session_clicked {
-            if let (Some(svc), Some(idx)) = (&self.service, self.selected_subscription) {
-                let key = BridgeService::session_key_for(&self.config.subscriptions[idx].name);
-                svc.clear_session(&key);
-                self.status_message = format!("已发送清除上下文指令: {key}");
-            }
-        }
-        if delete_selected {
-            if let Some(idx) = self.selected_subscription {
-                self.config.subscriptions.remove(idx);
-                self.selected_subscription = None;
-                self.save_config();
-            }
-        }
-        if save_detail {
-            self.save_config();
-        }
-        if close_detail {
-            self.selected_subscription = None;
-        }
-
-        // 新建订阅弹窗
-        if self.show_new_subscription_dialog {
-            egui::Window::new("新建订阅")
+        // 新建 Agent 弹窗
+        if self.show_new_agent_dialog {
+            egui::Window::new("新建 Agent")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .max_height(ctx.screen_rect().height() - 120.0)
-                .vscroll(true)
                 .show(ctx, |ui| {
                     ui.set_width(480.0);
 
                     let available_reporters = self.available_reporters.clone();
                     let available_filters = self.available_filters.clone();
                     let available_projects = self.available_projects.clone();
-                    Self::subscription_form(
-                        ui,
-                        &mut self.new_subscription,
-                        &available_reporters,
-                        &available_filters,
-                        &available_projects,
-                        "new",
-                    );
 
-                    ui.add_space(16.0);
+                    // 表单区单独滚动，按钮固定在弹窗底部，窗口再矮也不会被挤出可视区
+                    let form_max_h = (ctx.screen_rect().height() - 220.0).max(160.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(form_max_h)
+                        .show(ui, |ui| {
+                            Self::agent_form(
+                                ui,
+                                &mut self.new_agent,
+                                &available_reporters,
+                                &available_filters,
+                                &available_projects,
+                                "new",
+                            );
+                        });
+
+                    ui.add_space(12.0);
                     ui.separator();
                     ui.add_space(8.0);
 
-                    ui.horizontal(|ui| {
-                        if ui.add_sized([60.0, 28.0], egui::Button::new("取消")).clicked() {
-                            self.show_new_subscription_dialog = false;
-                            self.new_subscription = Subscription::default();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_sized([80.0, 28.0], egui::Button::new("✅ 创建")).clicked() {
+                            if !self.new_agent.name.is_empty()
+                                && !self.new_agent.webhook_url.is_empty()
+                                && !self.new_agent.base_prompt.is_empty()
+                            {
+                                self.config.agents.push(self.new_agent.clone());
+                                self.new_agent = Agent::default();
+                                self.show_new_agent_dialog = false;
+                                self.save_config();
+                                self.status_message = "Agent 已创建".to_string();
+                            } else {
+                                self.status_message = "请填写完整信息".to_string();
+                            }
                         }
 
                         ui.add_space(8.0);
 
-                        if ui.add_sized([80.0, 28.0], egui::Button::new("✅ 创建")).clicked() {
-                            if !self.new_subscription.name.is_empty()
-                                && !self.new_subscription.smee_url.is_empty()
-                                && !self.new_subscription.base_prompt.is_empty()
-                            {
-                                self.config.subscriptions.push(self.new_subscription.clone());
-                                self.new_subscription = Subscription::default();
-                                self.show_new_subscription_dialog = false;
-                                self.save_config();
-                                self.status_message = "订阅已添加".to_string();
-                            } else {
-                                self.status_message = "请填写完整信息".to_string();
-                            }
+                        if ui.add_sized([60.0, 28.0], egui::Button::new("取消")).clicked() {
+                            self.show_new_agent_dialog = false;
+                            self.new_agent = Agent::default();
                         }
                     });
                 });

@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Subscription {
+pub struct Agent {
     pub name: String,
-    pub smee_url: String,
+    /// 触发方式：Webhook 回调地址（smee.io 通道 URL）。
+    /// 旧配置字段名为 smee_url，通过 alias 兼容。
+    #[serde(alias = "smee_url")]
+    pub webhook_url: String,
     pub enabled: bool,
     pub base_prompt: String,
     /// 绑定的 cc-connect 项目名（register 消息的 `project` 字段）。
@@ -14,11 +17,11 @@ pub struct Subscription {
     pub filter_regex: Option<String>,
 }
 
-impl Default for Subscription {
+impl Default for Agent {
     fn default() -> Self {
         Self {
             name: String::new(),
-            smee_url: String::new(),
+            webhook_url: String::new(),
             enabled: true,
             base_prompt: String::new(),
             project: String::new(),
@@ -38,7 +41,9 @@ pub struct AppConfig {
     /// 启动 cc-connect 的命令行
     #[serde(default = "default_cc_connect_command")]
     pub cc_connect_command: String,
-    pub subscriptions: Vec<Subscription>,
+    /// Agent 列表。旧配置字段名为 subscriptions，通过 alias 兼容。
+    #[serde(alias = "subscriptions")]
+    pub agents: Vec<Agent>,
 }
 
 fn default_cc_connect_command() -> String {
@@ -51,7 +56,7 @@ impl Default for AppConfig {
             ws_url: "ws://localhost:9810/bridge/ws".to_string(),
             bridge_token: String::new(),
             cc_connect_command: default_cc_connect_command(),
-            subscriptions: vec![],
+            agents: vec![],
         }
     }
 }
@@ -88,7 +93,7 @@ impl AppConfig {
 }
 
 /// 读取 cc-connect 配置（~/.cc-connect/config.toml）中 `[[projects]]` 的项目名列表，
-/// 供订阅表单的项目下拉框使用。读取失败返回空列表（表单仍可选默认项目）。
+/// 供 Agent 表单的项目下拉框使用。读取失败返回空列表（表单仍可选默认项目）。
 pub fn scan_cc_connect_projects() -> Vec<String> {
     let Some(home) = dirs::home_dir() else {
         return vec![];
@@ -143,6 +148,26 @@ enabled = true
     name = "aicoding"
 "#;
         assert_eq!(projects_from_toml(text), vec!["master", "dev"]);
+    }
+
+    #[test]
+    fn old_subscription_config_loads_as_agents() {
+        // 旧版 gui-config.json 使用 subscriptions / smee_url 字段名
+        let json = r#"{
+            "ws_url": "ws://localhost:9810/bridge/ws",
+            "subscriptions": [{
+                "name": "issue处理",
+                "smee_url": "https://smee.io/abc",
+                "enabled": true,
+                "base_prompt": "处理 issue",
+                "reporter": "console",
+                "filter_regex": null
+            }]
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.agents.len(), 1);
+        assert_eq!(config.agents[0].name, "issue处理");
+        assert_eq!(config.agents[0].webhook_url, "https://smee.io/abc");
     }
 
     #[test]

@@ -65,12 +65,14 @@ MIT
 ```
 
 ### Filter 插件
-将自定义 filter WASM 文件放在 `~/.agent-loop/filters/` 目录：
+将自定义 filter WASM 文件放在 `~/.agent-loop/policy/` 目录：
 ```bash
 ~/.agent-loop/
-  └── filters/
-      ├── security-filter.wasm
-      └── custom-filter.wasm
+  └── policy/
+      ├── issue-mention.wasm           # issue/评论中提及 @claude0805 才放行
+      ├── issue-mention-claude01.wasm  # issue/评论中提及 @claude01 才放行
+      ├── pr-mention.wasm              # 新建 PR 标题/正文提及 @claude0805 才放行
+      └── security-filter.wasm
 ```
 
 插件会自动在 GUI 的下拉框中显示。
@@ -78,13 +80,32 @@ MIT
 ### 构建 WASM 插件
 参考 `wasm-plugins/` 目录下的示例：
 - `console-reporter`: Reporter 插件示例
-- `security-filter`: Filter 插件示例
+- `issue-mention` / `issue-mention-claude01` / `pr-mention` / `security-filter`: Filter 插件示例
 
-构建步骤：
+构建并安装（以 `issue-mention-claude01` 为例，需先安装 wasm 目标：`rustup target add wasm32-unknown-unknown`）：
+
 ```bash
-cd wasm-plugins/your-plugin
+# 1. 编译为 wasm（在插件目录内执行）
+cd wasm-plugins/issue-mention-claude01
 cargo build --target wasm32-unknown-unknown --release
-cp target/wasm32-unknown-unknown/release/your_plugin.wasm ~/.agent-loop/reporters/
-# 或
-cp target/wasm32-unknown-unknown/release/your_plugin.wasm ~/.agent-loop/filters/
+
+# 2. 拷贝到插件目录（注意：cargo 产物文件名是下划线，拷贝时改成连字符命名）
+#    Filter 插件 → ~/.agent-loop/policy/
+cp target/wasm32-unknown-unknown/release/issue_mention_claude01.wasm \
+   ~/.agent-loop/policy/issue-mention-claude01.wasm
+
+#    Reporter 插件 → ~/.agent-loop/reporters/
+# cp target/wasm32-unknown-unknown/release/console_reporter.wasm \
+#    ~/.agent-loop/reporters/console-reporter.wasm
 ```
+
+其他插件同理，例如重新编译安装 `issue-mention`：
+
+```bash
+cd wasm-plugins/issue-mention
+cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/issue_mention.wasm \
+   ~/.agent-loop/policy/issue-mention.wasm
+```
+
+安装后重启 GUI，即可在 Filter 下拉框中选择新插件（配置中 `wasmPolicy` 的值为文件名去掉 `.wasm` 后缀，如 `issue-mention-claude01`）。

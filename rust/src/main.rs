@@ -21,7 +21,8 @@ fn main() -> Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0])
+            // 宽度按一行 3 张 Agent 卡片计算：3×260 + 2×12 间距 + 面板边距/滚动条余量
+            .with_inner_size([860.0, 620.0])
             .with_min_inner_size([600.0, 400.0]),
         ..Default::default()
     };
